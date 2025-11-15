@@ -1,5 +1,7 @@
+import atexit
 import logging
 import os
+import queue
 import re
 import shutil
 import sqlite3
@@ -8,7 +10,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from time import monotonic
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from flask import Flask, jsonify, render_template, request
 
@@ -20,6 +22,7 @@ DAILY_BACKUP_RETENTION = int(os.getenv("DAILY_BACKUP_RETENTION", "30"))
 RATE_LIMIT_WINDOW_SECONDS = int(os.getenv("RATE_LIMIT_WINDOW_SECONDS", "5"))
 MAX_UPLOADS_PER_DAY = int(os.getenv("MAX_UPLOADS_PER_DAY", "30"))
 PAGE_SIZE = int(os.getenv("PAGE_SIZE", "100"))
+DB_WORKER_THREADS = int(os.getenv("DB_WORKER_THREADS", "4"))
 
 BSSID_PATTERN = re.compile(r"^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$")
 WPS_PIN_PATTERN = re.compile(r"^[0-9]{8}$")
@@ -263,6 +266,65 @@ class DailyBackupManager:
         return (next_midnight - now).total_seconds()
 
 
+class DatabaseWorkerPool:
+    def __init__(self, worker_count: int):
+        self._worker_count = max(1, worker_count)
+        self._tasks: "queue.Queue[Optional[Tuple[Callable[..., Any], tuple, dict, queue.Queue]]]" = queue.Queue()
+        self._threads: List[threading.Thread] = []
+        self._shutdown = threading.Event()
+
+        for index in range(self._worker_count):
+            thread = threading.Thread(
+                target=self._worker,
+                name=f"DatabaseWorker-{index + 1}",
+                daemon=True,
+            )
+            self._threads.append(thread)
+            thread.start()
+
+    def submit(self, func: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+        if self._shutdown.is_set():
+            raise RuntimeError("Database worker pool has been shut down")
+
+        result_queue: "queue.Queue[Tuple[bool, Any]]" = queue.Queue(maxsize=1)
+        self._tasks.put((func, args, kwargs, result_queue))
+        success, payload = result_queue.get()
+        if success:
+            return payload
+        if isinstance(payload, BaseException):
+            raise payload
+        raise RuntimeError("Database task failed without raising an exception")
+
+    def shutdown(self) -> None:
+        if self._shutdown.is_set():
+            return
+        self._shutdown.set()
+        for _ in self._threads:
+            self._tasks.put(None)
+        for thread in self._threads:
+            thread.join(timeout=2)
+
+    def _worker(self) -> None:
+        while True:
+            task = self._tasks.get()
+            if task is None:
+                self._tasks.task_done()
+                break
+            func, args, kwargs, result_queue = task
+            try:
+                result = func(*args, **kwargs)
+            except Exception as exc:  # pragma: no cover - defensive guard
+                result_queue.put((False, exc))
+            else:
+                result_queue.put((True, result))
+            finally:
+                self._tasks.task_done()
+
+
+database_worker_pool = DatabaseWorkerPool(DB_WORKER_THREADS)
+atexit.register(database_worker_pool.shutdown)
+
+
 def create_backup_provider() -> Optional[BaseBackupProvider]:
     provider_name = os.getenv("BACKUP_PROVIDER", "local").strip().lower()
     if provider_name == "none":
@@ -394,7 +456,7 @@ def validate_password(password: Optional[str]) -> str:
     return password
 
 
-def insert_record(
+def _insert_record_task(
     bssid: str,
     essid: str,
     password: str,
@@ -454,6 +516,26 @@ def insert_record(
     return WifiRecord.from_row(row)
 
 
+def insert_record(
+    bssid: str,
+    essid: str,
+    password: str,
+    wps_pin: str,
+    *,
+    wsc_device_name: Optional[str],
+    wsc_model: Optional[str],
+) -> WifiRecord:
+    return database_worker_pool.submit(
+        _insert_record_task,
+        bssid,
+        essid,
+        password,
+        wps_pin,
+        wsc_device_name=wsc_device_name,
+        wsc_model=wsc_model,
+    )
+
+
 def _build_query_filters(
     *,
     bssid: Optional[str] = None,
@@ -500,7 +582,7 @@ def _build_query_filters(
     return clauses, params
 
 
-def query_records(
+def _query_records_task(
     *,
     bssid: Optional[str] = None,
     essid: Optional[str] = None,
@@ -547,7 +629,33 @@ def query_records(
     return [WifiRecord.from_row(row) for row in rows]
 
 
-def count_records(
+def query_records(
+    *,
+    bssid: Optional[str] = None,
+    essid: Optional[str] = None,
+    password: Optional[str] = None,
+    wps_pin: Optional[str] = None,
+    wsc_device_name: Optional[str] = None,
+    wsc_model: Optional[str] = None,
+    search: Optional[str] = None,
+    limit: Optional[int] = None,
+    offset: Optional[int] = None,
+) -> List[WifiRecord]:
+    return database_worker_pool.submit(
+        _query_records_task,
+        bssid=bssid,
+        essid=essid,
+        password=password,
+        wps_pin=wps_pin,
+        wsc_device_name=wsc_device_name,
+        wsc_model=wsc_model,
+        search=search,
+        limit=limit,
+        offset=offset,
+    )
+
+
+def _count_records_task(
     *,
     bssid: Optional[str] = None,
     essid: Optional[str] = None,
@@ -574,6 +682,28 @@ def count_records(
     with get_db_connection() as conn:
         (total,) = conn.execute(sql, params).fetchone()
     return int(total)
+
+
+def count_records(
+    *,
+    bssid: Optional[str] = None,
+    essid: Optional[str] = None,
+    password: Optional[str] = None,
+    wps_pin: Optional[str] = None,
+    wsc_device_name: Optional[str] = None,
+    wsc_model: Optional[str] = None,
+    search: Optional[str] = None,
+) -> int:
+    return database_worker_pool.submit(
+        _count_records_task,
+        bssid=bssid,
+        essid=essid,
+        password=password,
+        wps_pin=wps_pin,
+        wsc_device_name=wsc_device_name,
+        wsc_model=wsc_model,
+        search=search,
+    )
 
 
 init_db()
