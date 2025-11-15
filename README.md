@@ -7,6 +7,7 @@ Lightweight Flask web service that exposes an HTML page and REST API for storing
 * Renders a table with columns **BSSID | ESSID | Password | WPS Pin | WSC Device Name | WSC Model | Added** on the landing page. The `Added` column shows the record month in `YYYY-MM` (UTC).
 * REST API for adding new entries and searching by BSSID, ESSID, password, WPS pin, WSC device name, WSC model, or any partial match.
 * Automatic database backups to local storage, Mega.nz, or another configured provider.
+* Request throttling so each client can only send a request every five seconds and no more than 30 uploads are accepted per day.
 * Provided strictly as a website template for safeguarding and testing your own Wi-Fi network.
 
 ## Quick start
@@ -80,6 +81,8 @@ Returns an array of all matching records for the specified BSSID or `404` when n
 ## Backups
 
 Backups run automatically in a background thread with the interval `BACKUP_INTERVAL_SECONDS` (default 3600 seconds).
+In addition, daily snapshots are written locally at the server's midnight (`00:00` local time) to the `daily_backups/` directory.
+The folder keeps at most 30 files (oldest snapshots are removed when the limit is exceeded) and is never uploaded to Mega.nz.
 
 The `BACKUP_PROVIDER` environment variable selects the provider:
 

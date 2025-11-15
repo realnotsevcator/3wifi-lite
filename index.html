@@ -8,16 +8,21 @@
     <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
 </head>
 <body>
-    <main class="container">
-        <header>
-            <h1>3WiFi Lite Database</h1>
-            <p>Latest stored Wi-Fi access points.</p>
-        </header>
-        <section class="search-area">
+    <main class="layout">
+        <section class="panel">
+            <div class="panel-header">
+                <h1 class="sr-only">3WiFi Lite</h1>
+                <div class="summary">
+                    <span>{{ records|length }} record{{ records|length != 1 and 's' or '' }}</span>
+                    {% if search %}
+                    <span class="muted">Filter: "{{ search }}"</span>
+                    {% endif %}
+                </div>
+            </div>
             <form method="get" class="search-form">
-                <label for="search">Search across BSSID, ESSID, password, WPS pin, device name, or model</label>
+                <label class="sr-only" for="search">Search by any field</label>
                 <div class="search-controls">
-                    <input type="text" id="search" name="search" value="{{ search }}" placeholder="Type a value such as 12 or ELTEX" />
+                    <input type="text" id="search" name="search" value="{{ search }}" placeholder="Search by BSSID, ESSID, password, WPS, device, or model" />
                     <button type="submit">Search</button>
                     {% if search %}
                     <a class="reset" href="{{ url_for('index') }}">Reset</a>
@@ -25,7 +30,7 @@
                 </div>
             </form>
         </section>
-        <section>
+        <section class="panel">
             {% if records %}
             <table>
                 <thead>
@@ -42,27 +47,30 @@
                 <tbody>
                     {% for record in records %}
                     <tr>
-                        <td class="mono">{{ record.bssid }}</td>
-                        <td>{{ record.essid }}</td>
-                        <td class="mono">{{ record.password or "" }}</td>
-                        <td class="mono">{{ record.wps_pin or "" }}</td>
-                        <td>{{ record.wsc_device_name or "" }}</td>
-                        <td>{{ record.wsc_model or "" }}</td>
-                        <td>{{ record.added }}</td>
+                        <td class="mono" data-label="BSSID">{{ record.bssid }}</td>
+                        <td data-label="ESSID">{{ record.essid }}</td>
+                        <td class="mono" data-label="Password">{{ record.password or "" }}</td>
+                        <td class="mono" data-label="WPS Pin">{{ record.wps_pin or "" }}</td>
+                        <td data-label="WSC Device Name">{{ record.wsc_device_name or "" }}</td>
+                        <td data-label="WSC Model">{{ record.wsc_model or "" }}</td>
+                        <td data-label="Added">{{ record.added }}</td>
                     </tr>
                     {% endfor %}
                 </tbody>
             </table>
             {% else %}
-            <p>The database is currently empty. Add records via the <code>/api/records</code> endpoint.</p>
+            <div class="empty-state">
+                <p>No records stored yet.</p>
+                <code>/api/records</code>
+            </div>
             {% endif %}
         </section>
-        <footer class="disclaimer">
-            <p>
-                This site template is provided solely for protecting and testing your own Wi-Fi network. Do not use it to
-                compromise third-party infrastructure.
-            </p>
-        </footer>
     </main>
+    <footer class="panel disclaimer">
+        <p>
+            This site template is provided solely for protecting and testing your own Wi-Fi network. Do not use it to
+            compromise third-party infrastructure.
+        </p>
+    </footer>
 </body>
 </html>
