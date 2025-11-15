@@ -1,0 +1,72 @@
+body {
+    background-color: #f7f7f7;
+    color: #222;
+    font-family: "Inter", "Segoe UI", system-ui, sans-serif;
+    margin: 0;
+}
+
+main {
+    margin-top: 3rem;
+}
+
+table {
+    width: 100%;
+    border-collapse: collapse;
+}
+
+th,
+td {
+    text-align: left;
+    padding: 0.75rem 0.5rem;
+    border-bottom: 1px solid #d1d1d1;
+}
+
+thead th {
+    background-color: #f0f0f0;
+    font-weight: 600;
+}
+
+.mono {
+    font-family: "Fira Mono", "Courier New", monospace;
+    font-size: 0.9rem;
+}
+
+.search-area {
+    margin-bottom: 2rem;
+}
+
+.search-form label {
+    display: block;
+    font-weight: 600;
+    margin-bottom: 0.75rem;
+}
+
+.search-controls {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.75rem;
+    align-items: center;
+}
+
+.search-controls input[type="text"] {
+    flex: 1 1 240px;
+    min-width: 200px;
+}
+
+.search-controls .reset {
+    color: #606c76;
+    text-decoration: underline;
+}
+
+.search-controls .reset:hover,
+.search-controls .reset:focus {
+    text-decoration: none;
+}
+
+.disclaimer {
+    margin-top: 3rem;
+    padding-top: 1.5rem;
+    border-top: 1px solid #d1d1d1;
+    color: #606c76;
+    font-size: 0.9rem;
+}
