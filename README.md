@@ -4,9 +4,10 @@ Lightweight Flask web service that exposes an HTML page and REST API for storing
 
 ## Features
 
-* Renders a table with columns **BSSID | ESSID | Password | WPS Pin | Added** on the landing page. The `Added` column shows the record month in `YYYY-MM` (UTC).
-* REST API for adding new entries and searching by BSSID, ESSID, password, WPS pin, or a partial match.
+* Renders a table with columns **BSSID | ESSID | Password | WPS Pin | WSC Device Name | WSC Model | Added** on the landing page. The `Added` column shows the record month in `YYYY-MM` (UTC).
+* REST API for adding new entries and searching by BSSID, ESSID, password, WPS pin, WSC device name, WSC model, or any partial match.
 * Automatic database backups to local storage, Mega.nz, or another configured provider.
+* Provided strictly as a website template for safeguarding and testing your own Wi-Fi network.
 
 ## Quick start
 
@@ -35,7 +36,9 @@ Request body:
   "bssid": "04:95:E6:37:C5:E8",
   "essid": "ExampleWiFi",
   "password": "secret123",
-  "wps_pin": "12345670" // or "NULL"
+  "wps_pin": "12345670", // or "NULL"
+  "wsc_device_name": "RouterBoard",
+  "wsc_model": "RB2011"
 }
 ```
 
@@ -45,6 +48,7 @@ Request body:
 * `wps_pin` — required. Either 8 digits or the string `NULL`.
 * `essid` — required field.
 * `password` — required and must be at least 8 characters long.
+* `wsc_device_name`, `wsc_model` — optional strings. Omit or send as empty strings when not available.
 
 Response `201 Created` returns the stored record in JSON.
 
@@ -56,11 +60,14 @@ GET /api/records?bssid=04:95:E6:37:C5:E8
 GET /api/records?essid=ExactESSID
 GET /api/records?password=rostelecom
 GET /api/records?wps_pin=12345670
+GET /api/records?wsc_device_name=RouterBoard
+GET /api/records?wsc_model=RB2011
 ```
 
-The `search` parameter performs a case-insensitive partial lookup on ESSID, BSSID, password, and WPS pin.
-Exact filters are available through the `bssid`, `essid`, `password`, and `wps_pin` query parameters.
-The response contains an array of objects with fields `bssid`, `essid`, `password`, `wps_pin`, `added` (month captured in `YYYY-MM`, UTC).
+The `search` parameter performs a case-insensitive partial lookup on BSSID, ESSID, password, WPS pin, WSC device name, and WSC model. You can search for any substring (for example `12`) via the API or the homepage search bar and all matching records will be returned.
+
+Exact filters are available through the `bssid`, `essid`, `password`, `wps_pin`, `wsc_device_name`, and `wsc_model` query parameters.
+The response contains an array of objects with fields `bssid`, `essid`, `password`, `wps_pin`, `wsc_device_name`, `wsc_model`, `added` (month captured in `YYYY-MM`, UTC).
 
 ### Fetch records by BSSID
 
@@ -112,6 +119,10 @@ python app.py
 ├── style.css
 └── README.md
 ```
+
+## Disclaimer
+
+This repository is a template meant solely for protecting and testing wireless networks that you own or administer. Always follow applicable laws and obtain explicit permission before interacting with third-party infrastructure.
 
 ## License
 

@@ -13,6 +13,18 @@
             <h1>3WiFi Lite Database</h1>
             <p>Latest stored Wi-Fi access points.</p>
         </header>
+        <section class="search-area">
+            <form method="get" class="search-form">
+                <label for="search">Search across BSSID, ESSID, password, WPS pin, device name, or model</label>
+                <div class="search-controls">
+                    <input type="text" id="search" name="search" value="{{ search }}" placeholder="Type a value such as 12 or ELTEX" />
+                    <button type="submit">Search</button>
+                    {% if search %}
+                    <a class="reset" href="{{ url_for('index') }}">Reset</a>
+                    {% endif %}
+                </div>
+            </form>
+        </section>
         <section>
             {% if records %}
             <table>
@@ -22,6 +34,8 @@
                         <th>ESSID</th>
                         <th>Password</th>
                         <th>WPS Pin</th>
+                        <th>WSC Device Name</th>
+                        <th>WSC Model</th>
                         <th>Added</th>
                     </tr>
                 </thead>
@@ -32,6 +46,8 @@
                         <td>{{ record.essid }}</td>
                         <td class="mono">{{ record.password or "" }}</td>
                         <td class="mono">{{ record.wps_pin or "" }}</td>
+                        <td>{{ record.wsc_device_name or "" }}</td>
+                        <td>{{ record.wsc_model or "" }}</td>
                         <td>{{ record.added }}</td>
                     </tr>
                     {% endfor %}
@@ -41,6 +57,12 @@
             <p>The database is currently empty. Add records via the <code>/api/records</code> endpoint.</p>
             {% endif %}
         </section>
+        <footer class="disclaimer">
+            <p>
+                This site template is provided solely for protecting and testing your own Wi-Fi network. Do not use it to
+                compromise third-party infrastructure.
+            </p>
+        </footer>
     </main>
 </body>
 </html>

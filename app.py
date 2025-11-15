@@ -39,10 +39,19 @@ def init_db() -> None:
                 essid TEXT NOT NULL,
                 password TEXT,
                 wps_pin TEXT,
+                wsc_device_name TEXT,
+                wsc_model TEXT,
                 added TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
             )
             """
         )
+        existing_columns = {
+            column_info["name"] for column_info in conn.execute("PRAGMA table_info(wifi_records)")
+        }
+        if "wsc_device_name" not in existing_columns:
+            conn.execute("ALTER TABLE wifi_records ADD COLUMN wsc_device_name TEXT")
+        if "wsc_model" not in existing_columns:
+            conn.execute("ALTER TABLE wifi_records ADD COLUMN wsc_model TEXT")
         conn.commit()
 
 
@@ -52,6 +61,8 @@ class WifiRecord:
     essid: str
     password: Optional[str]
     wps_pin: Optional[str]
+    wsc_device_name: Optional[str]
+    wsc_model: Optional[str]
     added: str
 
     @classmethod
@@ -61,6 +72,8 @@ class WifiRecord:
             essid=row["essid"],
             password=row["password"],
             wps_pin=row["wps_pin"],
+            wsc_device_name=row["wsc_device_name"],
+            wsc_model=row["wsc_model"],
             added=_format_timestamp(row["added"]),
         )
 
@@ -70,6 +83,8 @@ class WifiRecord:
             "essid": self.essid,
             "password": self.password,
             "wps_pin": self.wps_pin,
+            "wsc_device_name": self.wsc_device_name,
+            "wsc_model": self.wsc_model,
             "added": self.added,
         }
 
@@ -210,6 +225,13 @@ def _format_timestamp(value: Optional[str]) -> str:
     return dt.astimezone(timezone.utc).strftime("%Y-%m")
 
 
+def _normalize_optional_text(value: Optional[str]) -> Optional[str]:
+    if value is None:
+        return None
+    normalized = str(value).strip()
+    return normalized or None
+
+
 def validate_bssid(bssid: str) -> str:
     if not bssid:
         raise ValueError("BSSID is required")
@@ -249,19 +271,45 @@ def validate_password(password: Optional[str]) -> str:
     return password
 
 
-def insert_record(bssid: str, essid: str, password: str, wps_pin: str) -> WifiRecord:
+def insert_record(
+    bssid: str,
+    essid: str,
+    password: str,
+    wps_pin: str,
+    *,
+    wsc_device_name: Optional[str],
+    wsc_model: Optional[str],
+) -> WifiRecord:
     with get_db_connection() as conn:
         cursor = conn.execute(
             """
-            INSERT INTO wifi_records (bssid, essid, password, wps_pin)
-            VALUES (?, ?, ?, ?)
+            INSERT INTO wifi_records (
+                bssid,
+                essid,
+                password,
+                wps_pin,
+                wsc_device_name,
+                wsc_model
+            )
+            VALUES (?, ?, ?, ?, ?, ?)
             """,
-            (bssid, essid, password, wps_pin),
+            (bssid, essid, password, wps_pin, wsc_device_name, wsc_model),
         )
         conn.commit()
         record_id = cursor.lastrowid
         row = conn.execute(
-            "SELECT bssid, essid, password, wps_pin, added FROM wifi_records WHERE id = ?",
+            """
+            SELECT
+                bssid,
+                essid,
+                password,
+                wps_pin,
+                wsc_device_name,
+                wsc_model,
+                added
+            FROM wifi_records
+            WHERE id = ?
+            """,
             (record_id,),
         ).fetchone()
     return WifiRecord.from_row(row)
@@ -273,6 +321,8 @@ def query_records(
     essid: Optional[str] = None,
     password: Optional[str] = None,
     wps_pin: Optional[str] = None,
+    wsc_device_name: Optional[str] = None,
+    wsc_model: Optional[str] = None,
     search: Optional[str] = None,
     limit: Optional[int] = None,
 ) -> List[WifiRecord]:
@@ -291,14 +341,29 @@ def query_records(
     if wps_pin:
         clauses.append("wps_pin = ?")
         params.append(wps_pin.upper() if wps_pin.upper() == "NULL" else wps_pin)
+    if wsc_device_name:
+        clauses.append("wsc_device_name = ?")
+        params.append(wsc_device_name)
+    if wsc_model:
+        clauses.append("wsc_model = ?")
+        params.append(wsc_model)
     if search:
         like_term = f"%{search.lower()}%"
         clauses.append(
-            "(LOWER(essid) LIKE ? OR LOWER(bssid) LIKE ? OR LOWER(password) LIKE ? OR LOWER(wps_pin) LIKE ?)"
+            "(LOWER(essid) LIKE ?"
+            " OR LOWER(bssid) LIKE ?"
+            " OR LOWER(password) LIKE ?"
+            " OR LOWER(wps_pin) LIKE ?"
+            " OR LOWER(COALESCE(wsc_device_name, '')) LIKE ?"
+            " OR LOWER(COALESCE(wsc_model, '')) LIKE ?)"
         )
-        params.extend([like_term, like_term, like_term, like_term])
+        params.extend([like_term, like_term, like_term, like_term, like_term, like_term])
 
-    sql = "SELECT bssid, essid, password, wps_pin, added FROM wifi_records"
+    sql = (
+        "SELECT "
+        "bssid, essid, password, wps_pin, wsc_device_name, wsc_model, added "
+        "FROM wifi_records"
+    )
     if clauses:
         sql += " WHERE " + " AND ".join(clauses)
     sql += " ORDER BY datetime(added) DESC"
@@ -323,8 +388,10 @@ backup_manager.start()
 
 @app.route("/")
 def index() -> str:
-    records = query_records()
-    return render_template("index.html", records=records)
+    raw_search = request.args.get("search", "")
+    search = raw_search.strip()
+    records = query_records(search=search or None)
+    return render_template("index.html", records=records, search=search)
 
 
 @app.post("/api/records")
@@ -338,11 +405,20 @@ def add_record():
         essid = validate_essid(payload.get("essid", "").strip())
         password = validate_password(payload.get("password"))
         wps_pin = validate_wps_pin(payload.get("wps_pin"))
+        wsc_device_name = _normalize_optional_text(payload.get("wsc_device_name"))
+        wsc_model = _normalize_optional_text(payload.get("wsc_model"))
     except ValueError as exc:
         return jsonify({"error": str(exc)}), 400
 
     try:
-        record = insert_record(bssid=bssid, essid=essid, password=password, wps_pin=wps_pin)
+        record = insert_record(
+            bssid=bssid,
+            essid=essid,
+            password=password,
+            wps_pin=wps_pin,
+            wsc_device_name=wsc_device_name,
+            wsc_model=wsc_model,
+        )
     except sqlite3.IntegrityError as exc:
         logger.exception("Failed to insert record")
         return jsonify({"error": "Failed to insert record", "details": str(exc)}), 400
@@ -352,28 +428,28 @@ def add_record():
 
 @app.get("/api/records")
 def get_records():
-    search = request.args.get("search")
-    bssid = request.args.get("bssid")
-    essid = request.args.get("essid")
+    search = _normalize_optional_text(request.args.get("search"))
+    bssid = _normalize_optional_text(request.args.get("bssid"))
+    essid = _normalize_optional_text(request.args.get("essid"))
+    wsc_device_name = _normalize_optional_text(request.args.get("wsc_device_name"))
+    wsc_model = _normalize_optional_text(request.args.get("wsc_model"))
     try:
         limit = int(request.args.get("limit", "0"))
     except ValueError:
         return jsonify({"error": "limit must be an integer"}), 400
     limit = limit or None
 
-    password = request.args.get("password")
-    if password is not None:
-        password = password.strip() or None
+    password = _normalize_optional_text(request.args.get("password"))
 
-    wps_pin = request.args.get("wps_pin")
-    if wps_pin is not None:
-        wps_pin = wps_pin.strip() or None
+    wps_pin = _normalize_optional_text(request.args.get("wps_pin"))
 
     records = query_records(
         bssid=bssid,
         essid=essid,
         password=password,
         wps_pin=wps_pin,
+        wsc_device_name=wsc_device_name,
+        wsc_model=wsc_model,
         search=search,
         limit=limit,
     )
