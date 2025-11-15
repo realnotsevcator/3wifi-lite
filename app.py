@@ -746,7 +746,10 @@ def _query_records_task(
         query_params.append(offset)
 
     with get_db_connection() as conn:
-        rows = conn.exec_driver_sql(sql, query_params).fetchall()
+        if query_params:
+            rows = conn.exec_driver_sql(sql, tuple(query_params)).fetchall()
+        else:
+            rows = conn.exec_driver_sql(sql).fetchall()
     return [WifiRecord.from_row(row) for row in rows]
 
 
@@ -801,7 +804,10 @@ def _count_records_task(
         sql += " WHERE " + " AND ".join(clauses)
 
     with get_db_connection() as conn:
-        (total,) = conn.exec_driver_sql(sql, params).fetchone()
+        if params:
+            (total,) = conn.exec_driver_sql(sql, tuple(params)).fetchone()
+        else:
+            (total,) = conn.exec_driver_sql(sql).fetchone()
     return int(total)
 
 
