@@ -4,32 +4,79 @@ import os
 import queue
 import re
 import shutil
-import sqlite3
 import threading
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from time import monotonic
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Mapping, Optional, Tuple
 
 from flask import Flask, jsonify, render_template, request
+from sqlalchemy import create_engine, event
+from sqlalchemy.engine import Connection
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
+
+
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
+logger = logging.getLogger(__name__)
+
+
+def _get_int_env(name: str, default: int) -> int:
+    value = os.getenv(name)
+    if value is None or not value.strip():
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        logger.warning(
+            "Environment variable %s=%r is not an integer; falling back to %s",
+            name,
+            value,
+            default,
+        )
+        return default
+
+
+def _auto_worker_threads() -> int:
+    cpu_total = os.cpu_count()
+    if not cpu_total or cpu_total < 1:
+        return 1
+    # avoid spawning an excessive number of background workers on high-core systems
+    return max(1, min(32, cpu_total))
+
 
 APP_ROOT = Path(__file__).resolve().parent
 DATABASE_PATH = APP_ROOT / "data.sqlite3"
-BACKUP_INTERVAL_SECONDS = int(os.getenv("BACKUP_INTERVAL_SECONDS", "3600"))
+BACKUP_INTERVAL_SECONDS = _get_int_env("BACKUP_INTERVAL_SECONDS", 3600)
 DAILY_BACKUP_DIR = Path(os.getenv("DAILY_BACKUP_DIR", APP_ROOT / "daily_backups"))
-DAILY_BACKUP_RETENTION = int(os.getenv("DAILY_BACKUP_RETENTION", "30"))
-RATE_LIMIT_WINDOW_SECONDS = int(os.getenv("RATE_LIMIT_WINDOW_SECONDS", "5"))
-MAX_UPLOADS_PER_DAY = int(os.getenv("MAX_UPLOADS_PER_DAY", "30"))
-PAGE_SIZE = int(os.getenv("PAGE_SIZE", "100"))
-DB_WORKER_THREADS = int(os.getenv("DB_WORKER_THREADS", "4"))
+DAILY_BACKUP_RETENTION = _get_int_env("DAILY_BACKUP_RETENTION", 30)
+RATE_LIMIT_WINDOW_SECONDS = _get_int_env("RATE_LIMIT_WINDOW_SECONDS", 5)
+MAX_UPLOADS_PER_DAY = _get_int_env("MAX_UPLOADS_PER_DAY", 30)
+PAGE_SIZE = _get_int_env("PAGE_SIZE", 100)
+DB_WORKER_THREADS = _get_int_env("DB_WORKER_THREADS", _auto_worker_threads())
 
 BSSID_PATTERN = re.compile(r"^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$")
 WPS_PIN_PATTERN = re.compile(r"^[0-9]{8}$")
 
 
-logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
-logger = logging.getLogger(__name__)
+DATABASE_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+engine = create_engine(
+    f"sqlite:///{DATABASE_PATH}",
+    future=True,
+    connect_args={"check_same_thread": False},
+    pool_pre_ping=True,
+)
+
+
+@event.listens_for(engine, "connect")
+def _set_sqlite_pragma(dbapi_connection, connection_record):  # pragma: no cover - initialization hook
+    cursor = dbapi_connection.cursor()
+    cursor.execute("PRAGMA journal_mode=WAL")
+    cursor.execute("PRAGMA synchronous=NORMAL")
+    cursor.execute("PRAGMA foreign_keys=ON")
+    cursor.close()
 
 
 _last_request_times: Dict[str, float] = {}
@@ -37,15 +84,15 @@ _upload_counters: Dict[str, int] = {}
 _daily_upload_totals = {"date": None, "count": 0}
 
 
-def get_db_connection() -> sqlite3.Connection:
-    conn = sqlite3.connect(DATABASE_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
+@contextmanager
+def get_db_connection() -> Iterator[Connection]:
+    with engine.begin() as connection:
+        yield connection
 
 
 def init_db() -> None:
     with get_db_connection() as conn:
-        conn.execute(
+        conn.exec_driver_sql(
             """
             CREATE TABLE IF NOT EXISTS wifi_records (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -60,13 +107,13 @@ def init_db() -> None:
             """
         )
         existing_columns = {
-            column_info["name"] for column_info in conn.execute("PRAGMA table_info(wifi_records)")
+            column_info._mapping["name"]
+            for column_info in conn.exec_driver_sql("PRAGMA table_info(wifi_records)")
         }
         if "wsc_device_name" not in existing_columns:
-            conn.execute("ALTER TABLE wifi_records ADD COLUMN wsc_device_name TEXT")
+            conn.exec_driver_sql("ALTER TABLE wifi_records ADD COLUMN wsc_device_name TEXT")
         if "wsc_model" not in existing_columns:
-            conn.execute("ALTER TABLE wifi_records ADD COLUMN wsc_model TEXT")
-        conn.commit()
+            conn.exec_driver_sql("ALTER TABLE wifi_records ADD COLUMN wsc_model TEXT")
 
 
 @dataclass
@@ -80,15 +127,19 @@ class WifiRecord:
     added: str
 
     @classmethod
-    def from_row(cls, row: sqlite3.Row) -> "WifiRecord":
+    def from_row(cls, row: Mapping[str, Any]) -> "WifiRecord":
+        if hasattr(row, "_mapping"):
+            data = row._mapping  # type: ignore[attr-defined]
+        else:
+            data = row
         return cls(
-            bssid=row["bssid"],
-            essid=row["essid"],
-            password=row["password"],
-            wps_pin=row["wps_pin"],
-            wsc_device_name=row["wsc_device_name"],
-            wsc_model=row["wsc_model"],
-            added=_format_timestamp(row["added"]),
+            bssid=data["bssid"],
+            essid=data["essid"],
+            password=data["password"],
+            wps_pin=data["wps_pin"],
+            wsc_device_name=data["wsc_device_name"],
+            wsc_model=data["wsc_model"],
+            added=_format_timestamp(data["added"]),
         )
 
     def as_dict(self) -> dict:
@@ -466,7 +517,7 @@ def _insert_record_task(
     wsc_model: Optional[str],
 ) -> WifiRecord:
     with get_db_connection() as conn:
-        duplicate = conn.execute(
+        duplicate = conn.exec_driver_sql(
             """
             SELECT 1
             FROM wifi_records
@@ -482,7 +533,7 @@ def _insert_record_task(
             raise DuplicateRecordError(
                 "A record with the same BSSID, ESSID, Password, and WPS Pin already exists."
             )
-        cursor = conn.execute(
+        cursor = conn.exec_driver_sql(
             """
             INSERT INTO wifi_records (
                 bssid,
@@ -496,9 +547,10 @@ def _insert_record_task(
             """,
             (bssid, essid, password, wps_pin, wsc_device_name, wsc_model),
         )
-        conn.commit()
         record_id = cursor.lastrowid
-        row = conn.execute(
+        if record_id is None:
+            raise RuntimeError("Failed to retrieve inserted record identifier")
+        row = conn.exec_driver_sql(
             """
             SELECT
                 bssid,
@@ -513,6 +565,8 @@ def _insert_record_task(
             """,
             (record_id,),
         ).fetchone()
+        if row is None:
+            raise RuntimeError("Inserted record could not be retrieved")
     return WifiRecord.from_row(row)
 
 
@@ -625,7 +679,7 @@ def _query_records_task(
         query_params.append(offset)
 
     with get_db_connection() as conn:
-        rows = conn.execute(sql, query_params).fetchall()
+        rows = conn.exec_driver_sql(sql, query_params).fetchall()
     return [WifiRecord.from_row(row) for row in rows]
 
 
@@ -680,7 +734,7 @@ def _count_records_task(
         sql += " WHERE " + " AND ".join(clauses)
 
     with get_db_connection() as conn:
-        (total,) = conn.execute(sql, params).fetchone()
+        (total,) = conn.exec_driver_sql(sql, params).fetchone()
     return int(total)
 
 
@@ -810,9 +864,12 @@ def add_record():
         )
     except DuplicateRecordError as exc:
         return jsonify({"error": str(exc)}), 400
-    except sqlite3.IntegrityError as exc:
+    except IntegrityError as exc:
         logger.exception("Failed to insert record")
         return jsonify({"error": "Failed to insert record", "details": str(exc)}), 400
+    except SQLAlchemyError as exc:
+        logger.exception("Unexpected database error")
+        return jsonify({"error": "Database error", "details": str(exc)}), 500
 
     _mark_upload(ip)
     return jsonify(record.as_dict()), 201

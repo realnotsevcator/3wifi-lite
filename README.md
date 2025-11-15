@@ -111,6 +111,7 @@ python app.py
 | `LOCAL_BACKUP_DIR` | `./backups` | Directory for local copies |
 | `MEGA_EMAIL`, `MEGA_PASSWORD` | — | Mega.nz credentials |
 | `MEGA_FOLDER` | `3wifi-lite-backups` | Mega.nz folder name |
+| `DB_WORKER_THREADS` | Auto (CPU cores) | Worker threads for database tasks |
 
 ## Project layout
 
