@@ -5,7 +5,7 @@ import shutil
 import sqlite3
 import threading
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from time import monotonic
 from typing import Dict, List, Optional
@@ -29,7 +29,8 @@ logger = logging.getLogger(__name__)
 
 
 _last_request_times: Dict[str, float] = {}
-_upload_counters: Dict[str, Dict[str, object]] = {}
+_upload_counters: Dict[str, int] = {}
+_daily_upload_totals = {"date": None, "count": 0}
 
 
 def get_db_connection() -> sqlite3.Connection:
@@ -227,7 +228,7 @@ class DailyBackupManager:
         if not DATABASE_PATH.exists():
             logger.warning("Database file %s not found; skipping daily backup", DATABASE_PATH)
             return
-        timestamp = datetime.now(timezone.utc).strftime("%Y%m%d")
+        timestamp = datetime.now().strftime("%Y%m%d")
         destination = self.directory / f"wifi-daily-backup-{timestamp}.sqlite3"
         if destination.exists():
             logger.info("Daily backup already exists for %s; skipping", timestamp)
@@ -252,7 +253,7 @@ class DailyBackupManager:
 
     @staticmethod
     def _seconds_until_next_midnight() -> float:
-        now = datetime.now(timezone.utc)
+        now = datetime.now()
         next_midnight = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
         return (next_midnight - now).total_seconds()
 
@@ -298,21 +299,25 @@ def _prune_stale_rate_limits(now: float) -> None:
 
 
 def _can_upload_today(ip: str) -> bool:
-    today = datetime.now(timezone.utc).date()
-    entry = _upload_counters.get(ip)
-    if not entry or entry.get("date") != today:
-        _upload_counters[ip] = {"date": today, "count": 0}
-        entry = _upload_counters[ip]
-    return entry["count"] < MAX_UPLOADS_PER_DAY
+    today = datetime.now().date()
+    _refresh_daily_upload_state(today)
+    if _daily_upload_totals["count"] >= MAX_UPLOADS_PER_DAY:
+        return False
+    return _upload_counters.get(ip, 0) < MAX_UPLOADS_PER_DAY
 
 
 def _mark_upload(ip: str) -> None:
-    today = datetime.now(timezone.utc).date()
-    entry = _upload_counters.get(ip)
-    if not entry or entry.get("date") != today:
-        _upload_counters[ip] = {"date": today, "count": 0}
-        entry = _upload_counters[ip]
-    entry["count"] += 1
+    today = datetime.now().date()
+    _refresh_daily_upload_state(today)
+    _upload_counters[ip] = _upload_counters.get(ip, 0) + 1
+    _daily_upload_totals["count"] += 1
+
+
+def _refresh_daily_upload_state(today: date) -> None:
+    if _daily_upload_totals["date"] != today:
+        _daily_upload_totals["date"] = today
+        _daily_upload_totals["count"] = 0
+        _upload_counters.clear()
 
 
 def _format_timestamp(value: Optional[str]) -> str:
@@ -482,7 +487,7 @@ def query_records(
     sql += " ORDER BY datetime(added) DESC"
     if limit:
         sql += " LIMIT ?"
-        params.append(str(limit))
+        params.append(limit)
 
     with get_db_connection() as conn:
         rows = conn.execute(sql, params).fetchall()
@@ -503,25 +508,26 @@ daily_backup_manager.start()
 
 @app.before_request
 def enforce_request_limits():
-    if request.endpoint == "static":
+    if request.endpoint == "static" or RATE_LIMIT_WINDOW_SECONDS <= 0:
         return None
-    if request.path.startswith("/api/"):
-        ip = _get_client_ip()
-        now = monotonic()
-        last_seen = _last_request_times.get(ip)
-        if last_seen is not None and now - last_seen < RATE_LIMIT_WINDOW_SECONDS:
-            retry_after = max(0.0, RATE_LIMIT_WINDOW_SECONDS - (now - last_seen))
-            return (
-                jsonify(
-                    {
-                        "error": "Too many requests",
-                        "retry_after": round(retry_after, 2),
-                    }
-                ),
-                429,
-            )
-        _prune_stale_rate_limits(now)
-        _last_request_times[ip] = now
+
+    ip = _get_client_ip()
+    now = monotonic()
+    _prune_stale_rate_limits(now)
+
+    last_seen = _last_request_times.get(ip)
+    if last_seen is not None and now - last_seen < RATE_LIMIT_WINDOW_SECONDS:
+        retry_after = max(0.0, RATE_LIMIT_WINDOW_SECONDS - (now - last_seen))
+        response = jsonify(
+            {
+                "error": "Too many requests",
+                "retry_after": round(retry_after, 2),
+            }
+        )
+        response.headers["Retry-After"] = str(max(1, int(retry_after)))
+        return response, 429
+
+    _last_request_times[ip] = now
 
 
 @app.route("/")
