@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from time import monotonic
-from typing import Any, Callable, Dict, Iterator, List, Mapping, Optional, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Mapping, Optional, Tuple, Union
 
 from flask import Flask, jsonify, render_template, request
 from sqlalchemy import create_engine, event
@@ -452,24 +452,29 @@ def _refresh_daily_upload_state(today: date) -> None:
         _upload_counters.clear()
 
 
-def _format_timestamp(value: Optional[str]) -> str:
-    if not value:
+def _format_timestamp(value: Optional[Union[str, datetime]]) -> str:
+    if value is None:
         return ""
-    value = value.strip()
-    try:
-        if value.endswith("Z"):
-            dt = datetime.fromisoformat(value[:-1]).replace(tzinfo=timezone.utc)
-        else:
-            dt = datetime.fromisoformat(value)
-    except ValueError:
+    if isinstance(value, datetime):
+        dt = value
+    else:
+        text_value = str(value).strip()
+        if not text_value:
+            return ""
         try:
-            dt = datetime.strptime(value, "%Y-%m-%d %H:%M:%S")
-            dt = dt.replace(tzinfo=timezone.utc)
+            if text_value.endswith("Z"):
+                dt = datetime.fromisoformat(text_value[:-1]).replace(tzinfo=timezone.utc)
+            else:
+                dt = datetime.fromisoformat(text_value)
         except ValueError:
-            match = re.match(r"^(\d{4}-\d{2})", value)
-            if match:
-                return match.group(1)
-            return value
+            try:
+                dt = datetime.strptime(text_value, "%Y-%m-%d %H:%M:%S")
+                dt = dt.replace(tzinfo=timezone.utc)
+            except ValueError:
+                match = re.match(r"^(\d{4}-\d{2})", text_value)
+                if match:
+                    return match.group(1)
+                return text_value
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return dt.astimezone(timezone.utc).strftime("%Y-%m")
