@@ -3,18 +3,32 @@ import logging
 import os
 import queue
 import re
-import shutil
 import threading
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 from time import monotonic
 from typing import Any, Callable, Dict, Iterator, List, Mapping, Optional, Tuple, Union
 
 from flask import Flask, jsonify, render_template, request
-from sqlalchemy import create_engine, event
+from sqlalchemy import (
+    Column,
+    DateTime,
+    Index,
+    Integer,
+    MetaData,
+    String,
+    Table,
+    and_,
+    create_engine,
+    func,
+    insert,
+    or_,
+    select,
+)
 from sqlalchemy.engine import Connection
+from sqlalchemy.engine.url import make_url
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
 
@@ -47,44 +61,54 @@ def _auto_worker_threads() -> int:
 
 
 APP_ROOT = Path(__file__).resolve().parent
-DATABASE_PATH = APP_ROOT / "data.sqlite3"
-BACKUP_INTERVAL_SECONDS = _get_int_env("BACKUP_INTERVAL_SECONDS", 86400)
-DAILY_BACKUP_ROOT = Path(os.getenv("DAILY_BACKUP_ROOT", APP_ROOT / "daily_backups"))
-_legacy_daily_backup_dir = os.getenv("DAILY_BACKUP_DIR")
-if _legacy_daily_backup_dir:
-    THIRTY_DAY_BACKUP_DIR = Path(_legacy_daily_backup_dir)
-else:
-    THIRTY_DAY_BACKUP_DIR = Path(
-        os.getenv("THIRTY_DAY_BACKUP_DIR", DAILY_BACKUP_ROOT / "30-day-retention")
-    )
-THIRTY_DAY_BACKUP_RETENTION = _get_int_env("THIRTY_DAY_BACKUP_RETENTION", 30)
 RATE_LIMIT_WINDOW_SECONDS = _get_int_env("RATE_LIMIT_WINDOW_SECONDS", 5)
 MAX_UPLOADS_PER_DAY = _get_int_env("MAX_UPLOADS_PER_DAY", 30)
 PAGE_SIZE = _get_int_env("PAGE_SIZE", 100)
 DB_WORKER_THREADS = _get_int_env("DB_WORKER_THREADS", _auto_worker_threads())
-MEGA_BACKUP_FILENAME = os.getenv("MEGA_BACKUP_FILENAME", "data.sqlite3")
 
 BSSID_PATTERN = re.compile(r"^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$")
 WPS_PIN_PATTERN = re.compile(r"^[0-9]{8}$")
 
+raw_database_url = os.getenv("DATABASE_URL")
+if not raw_database_url:
+    raise RuntimeError(
+        "DATABASE_URL environment variable must be set to a MySQL connection string"
+    )
 
-DATABASE_PATH.parent.mkdir(parents=True, exist_ok=True)
+database_url_object = make_url(raw_database_url)
+if database_url_object.get_backend_name() != "mysql":
+    raise RuntimeError("DATABASE_URL must use the MySQL backend (e.g. mysql+pymysql)")
+
+DATABASE_URL = database_url_object.render_as_string(hide_password=False)
 
 engine = create_engine(
-    f"sqlite:///{DATABASE_PATH}",
+    DATABASE_URL,
     future=True,
-    connect_args={"check_same_thread": False},
     pool_pre_ping=True,
 )
 
 
-@event.listens_for(engine, "connect")
-def _set_sqlite_pragma(dbapi_connection, connection_record):  # pragma: no cover - initialization hook
-    cursor = dbapi_connection.cursor()
-    cursor.execute("PRAGMA journal_mode=WAL")
-    cursor.execute("PRAGMA synchronous=NORMAL")
-    cursor.execute("PRAGMA foreign_keys=ON")
-    cursor.close()
+metadata = MetaData()
+
+wifi_records_table = Table(
+    "wifi_records",
+    metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("bssid", String(17), nullable=False),
+    Column("essid", String(255), nullable=False),
+    Column("password", String(255)),
+    Column("wps_pin", String(16)),
+    Column("wsc_device_name", String(255)),
+    Column("wsc_model", String(255)),
+    Column("added", DateTime(timezone=True), server_default=func.now(), nullable=False),
+    mysql_engine="InnoDB",
+    mysql_charset="utf8mb4",
+    mysql_collate="utf8mb4_unicode_ci",
+)
+
+Index("ix_wifi_records_bssid", wifi_records_table.c.bssid)
+Index("ix_wifi_records_essid", wifi_records_table.c.essid)
+Index("ix_wifi_records_wps_pin", wifi_records_table.c.wps_pin)
 
 
 _last_request_times: Dict[str, float] = {}
@@ -99,29 +123,7 @@ def get_db_connection() -> Iterator[Connection]:
 
 
 def init_db() -> None:
-    with get_db_connection() as conn:
-        conn.exec_driver_sql(
-            """
-            CREATE TABLE IF NOT EXISTS wifi_records (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                bssid TEXT NOT NULL,
-                essid TEXT NOT NULL,
-                password TEXT,
-                wps_pin TEXT,
-                wsc_device_name TEXT,
-                wsc_model TEXT,
-                added TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
-            )
-            """
-        )
-        existing_columns = {
-            column_info._mapping["name"]
-            for column_info in conn.exec_driver_sql("PRAGMA table_info(wifi_records)")
-        }
-        if "wsc_device_name" not in existing_columns:
-            conn.exec_driver_sql("ALTER TABLE wifi_records ADD COLUMN wsc_device_name TEXT")
-        if "wsc_model" not in existing_columns:
-            conn.exec_driver_sql("ALTER TABLE wifi_records ADD COLUMN wsc_model TEXT")
+    metadata.create_all(engine, checkfirst=True)
 
 
 @dataclass
@@ -162,213 +164,8 @@ class WifiRecord:
         }
 
 
-class BackupError(RuntimeError):
-    """Raised when a backup cannot be created."""
-
-
 class DuplicateRecordError(ValueError):
     """Raised when attempting to add an existing Wi-Fi record."""
-
-
-class BaseBackupProvider:
-    def backup(self, source_path: Path, destination_name: str) -> None:
-        raise NotImplementedError
-
-
-def _validate_backup_source(source_path: Path) -> Path:
-    resolved_source = source_path.resolve()
-    expected_source = DATABASE_PATH.resolve()
-    if resolved_source != expected_source:
-        raise BackupError(
-            f"Backups are restricted to {expected_source}; received {resolved_source}"
-        )
-    if not resolved_source.exists():
-        raise BackupError(f"Database file {resolved_source} not found for backup")
-    return resolved_source
-
-
-class LocalBackupProvider(BaseBackupProvider):
-    def __init__(self, directory: Path):
-        self.directory = directory
-        self.directory.mkdir(parents=True, exist_ok=True)
-
-    def backup(self, source_path: Path, destination_name: str) -> None:
-        validated_source = _validate_backup_source(source_path)
-        destination = self.directory / destination_name
-        shutil.copy2(validated_source, destination)
-        logger.info("Stored local backup at %s", destination)
-
-
-class MegaBackupProvider(BaseBackupProvider):
-    def __init__(self, email: str, password: str, folder: str, remote_filename: str):
-        try:
-            from mega import Mega
-        except ImportError as exc:  # pragma: no cover - optional dependency
-            raise BackupError(
-                "mega.py package is required for Mega backups. Install it with 'pip install mega.py'."
-            ) from exc
-
-        self._mega = Mega()
-        self._m = self._mega.login(email, password)
-        self._folder_name = folder
-        self._folder_handle = self._ensure_folder(folder)
-        self._remote_filename = remote_filename
-        logger.info("Authenticated with Mega.nz for automatic backups")
-
-    def _ensure_folder(self, folder_name: str):
-        existing = self._m.find(folder_name)
-        if existing:
-            return existing[0]
-        created = self._m.create_folder(folder_name)
-        # mega.py returns dict mapping folder name to node id
-        return created[folder_name]
-
-    def backup(self, source_path: Path, destination_name: str) -> None:
-        validated_source = _validate_backup_source(source_path)
-        try:
-            self._purge_existing_backups()
-        except Exception as exc:  # pragma: no cover - safeguard for Mega API changes
-            raise BackupError("Failed to remove existing Mega.nz backups") from exc
-        logger.info("Uploading backup %s to Mega.nz", self._remote_filename)
-        self._m.upload(
-            str(validated_source),
-            dest=self._folder_handle,
-            dest_filename=self._remote_filename,
-        )
-
-    def _purge_existing_backups(self) -> None:
-        files = self._m.get_files()
-        stale_handles = [
-            handle
-            for handle, info in files.items()
-            if info.get("a")
-            and info["a"].get("n") == self._remote_filename
-            and info.get("p") == self._folder_handle
-        ]
-        for handle in stale_handles:
-            self._m.destroy(handle)
-            logger.info("Removed existing Mega.nz backup %s", self._remote_filename)
-
-
-class BackupManager:
-    def __init__(self, provider: Optional[BaseBackupProvider], interval_seconds: int):
-        self.provider = provider
-        self.interval_seconds = interval_seconds
-        self._stop_event = threading.Event()
-        self._thread: Optional[threading.Thread] = None
-
-    def start(self) -> None:
-        if self.provider is None:
-            logger.warning("Backup provider not configured; automatic backups are disabled")
-            return
-        if self._thread and self._thread.is_alive():
-            return
-        self._thread = threading.Thread(target=self._run, daemon=True)
-        self._thread.start()
-        logger.info("Backup manager started with interval %ss", self.interval_seconds)
-
-    def stop(self) -> None:
-        self._stop_event.set()
-        if self._thread:
-            self._thread.join(timeout=2)
-
-    def trigger_backup(self) -> None:
-        if not self.provider:
-            raise BackupError("Backup provider is not configured")
-        backup_name = _generate_backup_filename()
-        self.provider.backup(DATABASE_PATH, backup_name)
-
-    def _run(self) -> None:
-        first_run = True
-        while not self._stop_event.is_set():
-            wait_seconds = self._seconds_until_next_run(first_run)
-            first_run = False
-            if wait_seconds > 0 and self._stop_event.wait(wait_seconds):
-                break
-            try:
-                self.trigger_backup()
-            except BackupError as err:
-                logger.error("Backup failed: %s", err)
-            except Exception:  # pragma: no cover - safeguard
-                logger.exception("Unexpected error during backup")
-
-    def _seconds_until_next_run(self, first_run: bool) -> float:
-        if self.interval_seconds == 86400:
-            wait_seconds = DailyBackupManager._seconds_until_next_midnight()
-            return max(1, wait_seconds)
-        if first_run:
-            return 0
-        return max(1, float(self.interval_seconds))
-
-
-class DailyBackupManager:
-    """Create on-disk daily backups with strict local storage."""
-
-    def __init__(self, directory: Path, retention: int):
-        self.directory = directory
-        self.retention = max(1, retention)
-        self.directory.mkdir(parents=True, exist_ok=True)
-        self._stop_event = threading.Event()
-        self._thread: Optional[threading.Thread] = None
-
-    def start(self) -> None:
-        if self._thread and self._thread.is_alive():
-            return
-        self._thread = threading.Thread(target=self._run, daemon=True)
-        self._thread.start()
-        logger.info(
-            "Daily backup manager started at directory %s with retention %s", self.directory, self.retention
-        )
-
-    def stop(self) -> None:
-        self._stop_event.set()
-        if self._thread:
-            self._thread.join(timeout=2)
-
-    def _run(self) -> None:
-        while not self._stop_event.is_set():
-            wait_seconds = self._seconds_until_next_midnight()
-            if wait_seconds <= 0:
-                wait_seconds = 1
-            if self._stop_event.wait(wait_seconds):
-                break
-            try:
-                self._create_backup()
-            except Exception:  # pragma: no cover - safeguard
-                logger.exception("Unexpected error while creating daily backup")
-
-    def _create_backup(self) -> None:
-        if not DATABASE_PATH.exists():
-            logger.warning("Database file %s not found; skipping daily backup", DATABASE_PATH)
-            return
-        timestamp = datetime.now().strftime("%Y%m%d")
-        destination = self.directory / f"wifi-daily-backup-{timestamp}.sqlite3"
-        if destination.exists():
-            logger.info("Daily backup already exists for %s; skipping", timestamp)
-        else:
-            shutil.copy2(DATABASE_PATH, destination)
-            logger.info("Created daily backup at %s", destination)
-        self._enforce_retention()
-
-    def _enforce_retention(self) -> None:
-        backups = sorted(
-            self.directory.glob("wifi-daily-backup-*.sqlite3"),
-            key=lambda path: path.stat().st_mtime,
-        )
-        excess = len(backups) - self.retention
-        for i in range(excess):
-            to_remove = backups[i]
-            try:
-                to_remove.unlink()
-                logger.info("Removed expired daily backup %s", to_remove)
-            except FileNotFoundError:
-                logger.debug("Daily backup %s already removed", to_remove)
-
-    @staticmethod
-    def _seconds_until_next_midnight() -> float:
-        now = datetime.now()
-        next_midnight = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
-        return (next_midnight - now).total_seconds()
 
 
 class DatabaseWorkerPool:
@@ -428,36 +225,6 @@ class DatabaseWorkerPool:
 
 database_worker_pool = DatabaseWorkerPool(DB_WORKER_THREADS)
 atexit.register(database_worker_pool.shutdown)
-
-
-def create_backup_provider() -> Optional[BaseBackupProvider]:
-    provider_name = os.getenv("BACKUP_PROVIDER", "local").strip().lower()
-    if provider_name == "none":
-        return None
-    if provider_name == "local":
-        directory = Path(os.getenv("LOCAL_BACKUP_DIR", APP_ROOT / "backups"))
-        return LocalBackupProvider(directory=directory)
-    if provider_name == "mega":
-        email = os.getenv("MEGA_EMAIL")
-        password = os.getenv("MEGA_PASSWORD")
-        folder = os.getenv("MEGA_FOLDER", "3wifi-lite-backups")
-        if not email or not password:
-            raise BackupError(
-                "MEGA_EMAIL and MEGA_PASSWORD environment variables must be set for Mega backups"
-            )
-        remote_filename = os.getenv("MEGA_BACKUP_FILENAME", MEGA_BACKUP_FILENAME)
-        return MegaBackupProvider(
-            email=email,
-            password=password,
-            folder=folder,
-            remote_filename=remote_filename,
-        )
-    raise BackupError(f"Unsupported backup provider: {provider_name}")
-
-
-def _generate_backup_filename() -> str:
-    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    return f"wifi-backup-{timestamp}.sqlite3"
 
 
 def _get_client_ip() -> str:
@@ -584,54 +351,50 @@ def _insert_record_task(
     wsc_model: Optional[str],
 ) -> WifiRecord:
     with get_db_connection() as conn:
-        duplicate = conn.exec_driver_sql(
-            """
-            SELECT 1
-            FROM wifi_records
-            WHERE bssid = ?
-              AND essid = ?
-              AND password = ?
-              AND wps_pin = ?
-            LIMIT 1
-            """,
-            (bssid, essid, password, wps_pin),
-        ).fetchone()
+        duplicate_query = (
+            select(wifi_records_table.c.id)
+            .where(
+                and_(
+                    wifi_records_table.c.bssid == bssid,
+                    wifi_records_table.c.essid == essid,
+                    wifi_records_table.c.password == password,
+                    wifi_records_table.c.wps_pin == wps_pin,
+                )
+            )
+            .limit(1)
+        )
+        duplicate = conn.execute(duplicate_query).first()
         if duplicate:
             raise DuplicateRecordError(
                 "A record with the same BSSID, ESSID, Password, and WPS Pin already exists."
             )
-        cursor = conn.exec_driver_sql(
-            """
-            INSERT INTO wifi_records (
-                bssid,
-                essid,
-                password,
-                wps_pin,
-                wsc_device_name,
-                wsc_model
-            )
-            VALUES (?, ?, ?, ?, ?, ?)
-            """,
-            (bssid, essid, password, wps_pin, wsc_device_name, wsc_model),
+        insert_stmt = insert(wifi_records_table).values(
+            bssid=bssid,
+            essid=essid,
+            password=password,
+            wps_pin=wps_pin,
+            wsc_device_name=wsc_device_name,
+            wsc_model=wsc_model,
         )
-        record_id = cursor.lastrowid
+        result = conn.execute(insert_stmt)
+        record_id = result.inserted_primary_key[0] if result.inserted_primary_key else None
         if record_id is None:
             raise RuntimeError("Failed to retrieve inserted record identifier")
-        row = conn.exec_driver_sql(
-            """
-            SELECT
-                bssid,
-                essid,
-                password,
-                wps_pin,
-                wsc_device_name,
-                wsc_model,
-                added
-            FROM wifi_records
-            WHERE id = ?
-            """,
-            (record_id,),
-        ).fetchone()
+        row = (
+            conn.execute(
+                select(
+                    wifi_records_table.c.bssid,
+                    wifi_records_table.c.essid,
+                    wifi_records_table.c.password,
+                    wifi_records_table.c.wps_pin,
+                    wifi_records_table.c.wsc_device_name,
+                    wifi_records_table.c.wsc_model,
+                    wifi_records_table.c.added,
+                ).where(wifi_records_table.c.id == record_id)
+            )
+            .mappings()
+            .first()
+        )
         if row is None:
             raise RuntimeError("Inserted record could not be retrieved")
     return WifiRecord.from_row(row)
@@ -666,41 +429,38 @@ def _build_query_filters(
     wsc_device_name: Optional[str] = None,
     wsc_model: Optional[str] = None,
     search: Optional[str] = None,
-) -> Tuple[List[str], List[str]]:
-    clauses: List[str] = []
-    params: List[str] = []
+) -> List[Any]:
+    clauses: List[Any] = []
 
     if bssid:
-        clauses.append("bssid = ?")
-        params.append(bssid.upper())
+        clauses.append(wifi_records_table.c.bssid == bssid.upper())
     if essid:
-        clauses.append("essid = ?")
-        params.append(essid)
+        clauses.append(wifi_records_table.c.essid == essid)
     if password:
-        clauses.append("password = ?")
-        params.append(password)
+        clauses.append(wifi_records_table.c.password == password)
     if wps_pin:
-        clauses.append("wps_pin = ?")
-        params.append(wps_pin.upper() if wps_pin.upper() == "NULL" else wps_pin)
+        normalized_pin = wps_pin.upper() if wps_pin.upper() == "NULL" else wps_pin
+        clauses.append(wifi_records_table.c.wps_pin == normalized_pin)
     if wsc_device_name:
-        clauses.append("wsc_device_name = ?")
-        params.append(wsc_device_name)
+        clauses.append(wifi_records_table.c.wsc_device_name == wsc_device_name)
     if wsc_model:
-        clauses.append("wsc_model = ?")
-        params.append(wsc_model)
+        clauses.append(wifi_records_table.c.wsc_model == wsc_model)
     if search:
         like_term = f"%{search.lower()}%"
         clauses.append(
-            "(LOWER(essid) LIKE ?"
-            " OR LOWER(bssid) LIKE ?"
-            " OR LOWER(password) LIKE ?"
-            " OR LOWER(wps_pin) LIKE ?"
-            " OR LOWER(COALESCE(wsc_device_name, '')) LIKE ?"
-            " OR LOWER(COALESCE(wsc_model, '')) LIKE ?)"
+            or_(
+                func.lower(wifi_records_table.c.essid).like(like_term),
+                func.lower(wifi_records_table.c.bssid).like(like_term),
+                func.lower(wifi_records_table.c.password).like(like_term),
+                func.lower(wifi_records_table.c.wps_pin).like(like_term),
+                func.lower(func.coalesce(wifi_records_table.c.wsc_device_name, "")).like(
+                    like_term
+                ),
+                func.lower(func.coalesce(wifi_records_table.c.wsc_model, "")).like(like_term),
+            )
         )
-        params.extend([like_term, like_term, like_term, like_term, like_term, like_term])
 
-    return clauses, params
+    return clauses
 
 
 def _query_records_task(
@@ -715,7 +475,7 @@ def _query_records_task(
     limit: Optional[int] = None,
     offset: Optional[int] = None,
 ) -> List[WifiRecord]:
-    clauses, params = _build_query_filters(
+    clauses = _build_query_filters(
         bssid=bssid,
         essid=essid,
         password=password,
@@ -724,32 +484,27 @@ def _query_records_task(
         wsc_model=wsc_model,
         search=search,
     )
-
-    sql = (
-        "SELECT "
-        "bssid, essid, password, wps_pin, wsc_device_name, wsc_model, added "
-        "FROM wifi_records"
+    query = (
+        select(
+            wifi_records_table.c.bssid,
+            wifi_records_table.c.essid,
+            wifi_records_table.c.password,
+            wifi_records_table.c.wps_pin,
+            wifi_records_table.c.wsc_device_name,
+            wifi_records_table.c.wsc_model,
+            wifi_records_table.c.added,
+        )
+        .order_by(wifi_records_table.c.added.desc())
     )
     if clauses:
-        sql += " WHERE " + " AND ".join(clauses)
-    sql += " ORDER BY datetime(added) DESC"
-
-    query_params = list(params)
+        query = query.where(and_(*clauses))
     if limit is not None:
-        sql += " LIMIT ?"
-        query_params.append(limit)
-        if offset is not None:
-            sql += " OFFSET ?"
-            query_params.append(offset)
-    elif offset is not None:
-        sql += " LIMIT -1 OFFSET ?"
-        query_params.append(offset)
+        query = query.limit(limit)
+    if offset is not None:
+        query = query.offset(offset)
 
     with get_db_connection() as conn:
-        if query_params:
-            rows = conn.exec_driver_sql(sql, tuple(query_params)).fetchall()
-        else:
-            rows = conn.exec_driver_sql(sql).fetchall()
+        rows = conn.execute(query).mappings().all()
     return [WifiRecord.from_row(row) for row in rows]
 
 
@@ -789,7 +544,7 @@ def _count_records_task(
     wsc_model: Optional[str] = None,
     search: Optional[str] = None,
 ) -> int:
-    clauses, params = _build_query_filters(
+    clauses = _build_query_filters(
         bssid=bssid,
         essid=essid,
         password=password,
@@ -799,15 +554,12 @@ def _count_records_task(
         search=search,
     )
 
-    sql = "SELECT COUNT(*) FROM wifi_records"
+    query = select(func.count()).select_from(wifi_records_table)
     if clauses:
-        sql += " WHERE " + " AND ".join(clauses)
+        query = query.where(and_(*clauses))
 
     with get_db_connection() as conn:
-        if params:
-            (total,) = conn.exec_driver_sql(sql, tuple(params)).fetchone()
-        else:
-            (total,) = conn.exec_driver_sql(sql).fetchone()
+        (total,) = conn.execute(query).one()
     return int(total)
 
 
@@ -839,13 +591,6 @@ app = Flask(
     template_folder=str(APP_ROOT),
     static_folder=str(APP_ROOT),
 )
-backup_manager = BackupManager(create_backup_provider(), BACKUP_INTERVAL_SECONDS)
-backup_manager.start()
-daily_backup_manager = DailyBackupManager(
-    THIRTY_DAY_BACKUP_DIR,
-    THIRTY_DAY_BACKUP_RETENTION,
-)
-daily_backup_manager.start()
 
 
 @app.before_request
