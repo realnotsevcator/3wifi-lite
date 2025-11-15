@@ -167,14 +167,27 @@ class BaseBackupProvider:
         raise NotImplementedError
 
 
+def _validate_backup_source(source_path: Path) -> Path:
+    resolved_source = source_path.resolve()
+    expected_source = DATABASE_PATH.resolve()
+    if resolved_source != expected_source:
+        raise BackupError(
+            f"Backups are restricted to {expected_source}; received {resolved_source}"
+        )
+    if not resolved_source.exists():
+        raise BackupError(f"Database file {resolved_source} not found for backup")
+    return resolved_source
+
+
 class LocalBackupProvider(BaseBackupProvider):
     def __init__(self, directory: Path):
         self.directory = directory
         self.directory.mkdir(parents=True, exist_ok=True)
 
     def backup(self, source_path: Path, destination_name: str) -> None:
+        validated_source = _validate_backup_source(source_path)
         destination = self.directory / destination_name
-        shutil.copy2(source_path, destination)
+        shutil.copy2(validated_source, destination)
         logger.info("Stored local backup at %s", destination)
 
 
@@ -202,9 +215,10 @@ class MegaBackupProvider(BaseBackupProvider):
         return created[folder_name]
 
     def backup(self, source_path: Path, destination_name: str) -> None:
+        validated_source = _validate_backup_source(source_path)
         logger.info("Uploading backup %s to Mega.nz", destination_name)
         self._m.upload(
-            str(source_path),
+            str(validated_source),
             dest=self._folder_handle,
             dest_filename=destination_name,
         )
