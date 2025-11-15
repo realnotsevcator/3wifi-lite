@@ -103,6 +103,10 @@ class BackupError(RuntimeError):
     """Raised when a backup cannot be created."""
 
 
+class DuplicateRecordError(ValueError):
+    """Raised when attempting to add an existing Wi-Fi record."""
+
+
 class BaseBackupProvider:
     def backup(self, source_path: Path, destination_name: str) -> None:
         raise NotImplementedError
@@ -399,6 +403,22 @@ def insert_record(
     wsc_model: Optional[str],
 ) -> WifiRecord:
     with get_db_connection() as conn:
+        duplicate = conn.execute(
+            """
+            SELECT 1
+            FROM wifi_records
+            WHERE bssid = ?
+              AND essid = ?
+              AND password = ?
+              AND wps_pin = ?
+            LIMIT 1
+            """,
+            (bssid, essid, password, wps_pin),
+        ).fetchone()
+        if duplicate:
+            raise DuplicateRecordError(
+                "A record with the same BSSID, ESSID, Password, and WPS Pin already exists."
+            )
         cursor = conn.execute(
             """
             INSERT INTO wifi_records (
@@ -517,14 +537,7 @@ def enforce_request_limits():
 
     last_seen = _last_request_times.get(ip)
     if last_seen is not None and now - last_seen < RATE_LIMIT_WINDOW_SECONDS:
-        retry_after = max(0.0, RATE_LIMIT_WINDOW_SECONDS - (now - last_seen))
-        response = jsonify(
-            {
-                "error": "Too many requests",
-                "retry_after": round(retry_after, 2),
-            }
-        )
-        response.headers["Retry-After"] = str(max(1, int(retry_after)))
+        response = jsonify({"error": "Please wait before use this again!"})
         return response, 429
 
     _last_request_times[ip] = now
@@ -566,6 +579,8 @@ def add_record():
             wsc_device_name=wsc_device_name,
             wsc_model=wsc_model,
         )
+    except DuplicateRecordError as exc:
+        return jsonify({"error": str(exc)}), 400
     except sqlite3.IntegrityError as exc:
         logger.exception("Failed to insert record")
         return jsonify({"error": "Failed to insert record", "details": str(exc)}), 400
