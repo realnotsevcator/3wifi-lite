@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from time import monotonic
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from flask import Flask, jsonify, render_template, request
 
@@ -19,6 +19,7 @@ DAILY_BACKUP_DIR = Path(os.getenv("DAILY_BACKUP_DIR", APP_ROOT / "daily_backups"
 DAILY_BACKUP_RETENTION = int(os.getenv("DAILY_BACKUP_RETENTION", "30"))
 RATE_LIMIT_WINDOW_SECONDS = int(os.getenv("RATE_LIMIT_WINDOW_SECONDS", "5"))
 MAX_UPLOADS_PER_DAY = int(os.getenv("MAX_UPLOADS_PER_DAY", "30"))
+PAGE_SIZE = int(os.getenv("PAGE_SIZE", "100"))
 
 BSSID_PATTERN = re.compile(r"^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$")
 WPS_PIN_PATTERN = re.compile(r"^[0-9]{8}$")
@@ -453,7 +454,7 @@ def insert_record(
     return WifiRecord.from_row(row)
 
 
-def query_records(
+def _build_query_filters(
     *,
     bssid: Optional[str] = None,
     essid: Optional[str] = None,
@@ -462,8 +463,7 @@ def query_records(
     wsc_device_name: Optional[str] = None,
     wsc_model: Optional[str] = None,
     search: Optional[str] = None,
-    limit: Optional[int] = None,
-) -> List[WifiRecord]:
+) -> Tuple[List[str], List[str]]:
     clauses: List[str] = []
     params: List[str] = []
 
@@ -497,6 +497,31 @@ def query_records(
         )
         params.extend([like_term, like_term, like_term, like_term, like_term, like_term])
 
+    return clauses, params
+
+
+def query_records(
+    *,
+    bssid: Optional[str] = None,
+    essid: Optional[str] = None,
+    password: Optional[str] = None,
+    wps_pin: Optional[str] = None,
+    wsc_device_name: Optional[str] = None,
+    wsc_model: Optional[str] = None,
+    search: Optional[str] = None,
+    limit: Optional[int] = None,
+    offset: Optional[int] = None,
+) -> List[WifiRecord]:
+    clauses, params = _build_query_filters(
+        bssid=bssid,
+        essid=essid,
+        password=password,
+        wps_pin=wps_pin,
+        wsc_device_name=wsc_device_name,
+        wsc_model=wsc_model,
+        search=search,
+    )
+
     sql = (
         "SELECT "
         "bssid, essid, password, wps_pin, wsc_device_name, wsc_model, added "
@@ -505,13 +530,50 @@ def query_records(
     if clauses:
         sql += " WHERE " + " AND ".join(clauses)
     sql += " ORDER BY datetime(added) DESC"
-    if limit:
+
+    query_params = list(params)
+    if limit is not None:
         sql += " LIMIT ?"
-        params.append(limit)
+        query_params.append(limit)
+        if offset is not None:
+            sql += " OFFSET ?"
+            query_params.append(offset)
+    elif offset is not None:
+        sql += " LIMIT -1 OFFSET ?"
+        query_params.append(offset)
 
     with get_db_connection() as conn:
-        rows = conn.execute(sql, params).fetchall()
+        rows = conn.execute(sql, query_params).fetchall()
     return [WifiRecord.from_row(row) for row in rows]
+
+
+def count_records(
+    *,
+    bssid: Optional[str] = None,
+    essid: Optional[str] = None,
+    password: Optional[str] = None,
+    wps_pin: Optional[str] = None,
+    wsc_device_name: Optional[str] = None,
+    wsc_model: Optional[str] = None,
+    search: Optional[str] = None,
+) -> int:
+    clauses, params = _build_query_filters(
+        bssid=bssid,
+        essid=essid,
+        password=password,
+        wps_pin=wps_pin,
+        wsc_device_name=wsc_device_name,
+        wsc_model=wsc_model,
+        search=search,
+    )
+
+    sql = "SELECT COUNT(*) FROM wifi_records"
+    if clauses:
+        sql += " WHERE " + " AND ".join(clauses)
+
+    with get_db_connection() as conn:
+        (total,) = conn.execute(sql, params).fetchone()
+    return int(total)
 
 
 init_db()
@@ -547,8 +609,45 @@ def enforce_request_limits():
 def index() -> str:
     raw_search = request.args.get("search", "")
     search = raw_search.strip()
-    records = query_records(search=search or None)
-    return render_template("index.html", records=records, search=search)
+    page_param = request.args.get("page", "1")
+    try:
+        page = int(page_param)
+    except ValueError:
+        page = 1
+    if page < 1:
+        page = 1
+
+    per_page = PAGE_SIZE
+    total_count = count_records(search=search or None)
+    total_pages = (total_count + per_page - 1) // per_page if total_count else 0
+
+    if total_pages == 0:
+        page = 1
+        offset = 0
+    else:
+        if page > total_pages:
+            page = total_pages
+        offset = (page - 1) * per_page
+
+    records = query_records(search=search or None, limit=per_page, offset=offset if total_count else 0)
+    start_index = offset + 1 if total_count else 0
+    end_index = offset + len(records) if total_count else 0
+    has_prev = total_pages > 0 and page > 1
+    has_next = total_pages > 0 and page < total_pages
+
+    return render_template(
+        "index.html",
+        records=records,
+        search=search,
+        page=page,
+        per_page=per_page,
+        total_count=total_count,
+        total_pages=total_pages,
+        start_index=start_index,
+        end_index=end_index,
+        has_prev=has_prev,
+        has_next=has_next,
+    )
 
 
 @app.post("/api/records")

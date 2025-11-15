@@ -188,6 +188,45 @@ tr:nth-child(even) td {
     border-radius: 6px;
 }
 
+.pagination {
+    margin-top: 1.25rem;
+    display: flex;
+    align-items: center;
+    gap: 1rem;
+    justify-content: center;
+    flex-wrap: wrap;
+    color: var(--muted);
+    font-weight: 500;
+}
+
+.pagination-link {
+    color: var(--accent);
+    text-decoration: none;
+    padding: 0.5rem 0.75rem;
+    border-radius: 6px;
+    border: 1px solid transparent;
+    transition: color 0.2s ease, border-color 0.2s ease, background-color 0.2s ease;
+}
+
+.pagination-link:hover,
+.pagination-link:focus {
+    border-color: var(--accent);
+    background-color: rgba(108, 117, 125, 0.08);
+    outline: none;
+}
+
+.pagination-link.disabled {
+    color: var(--muted);
+    border-color: transparent;
+    background: none;
+    cursor: default;
+    pointer-events: none;
+}
+
+.pagination-status {
+    color: var(--muted);
+}
+
 .disclaimer {
     box-shadow: none;
     background: #f1f2f5;
