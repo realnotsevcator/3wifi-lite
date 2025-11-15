@@ -43,6 +43,11 @@ PAGE_SIZE = _get_int_env("PAGE_SIZE", 100)
 BSSID_PATTERN = re.compile(r"^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$")
 WPS_PIN_PATTERN = re.compile(r"^[0-9]{8}$")
 
+# 3–6 octets separated by colons (e.g. XX:XX:XX or XX:XX:XX:XX:XX:XX)
+PARTIAL_BSSID_SEARCH_PATTERN = re.compile(
+    r"^([0-9A-Fa-f]{2}:){2,5}[0-9A-Fa-f]{2}$"
+)
+
 
 @dataclass(frozen=True)
 class DatabaseConfig:
@@ -354,6 +359,9 @@ def _build_query_filters(
     wsc_device_name: Optional[str] = None,
     wsc_model: Optional[str] = None,
     search: Optional[str] = None,
+    search_include_bssid: bool = True,
+    search_include_wps_pin: bool = True,
+    search_only_bssid: bool = False,
 ) -> Tuple[List[str], List[Any]]:
     clauses: List[str] = []
     params: List[Any] = []
@@ -379,12 +387,32 @@ def _build_query_filters(
         params.append(wsc_model)
     if search:
         like_term = f"%{search.lower()}%"
-        clauses.append(
-            "(LOWER(essid) LIKE %s OR LOWER(bssid) LIKE %s OR LOWER(password) LIKE %s "
-            "OR LOWER(wps_pin) LIKE %s OR LOWER(COALESCE(wsc_device_name, '')) LIKE %s "
-            "OR LOWER(COALESCE(wsc_model, '')) LIKE %s)"
-        )
-        params.extend([like_term] * 6)
+        if search_only_bssid:
+            clauses.append("LOWER(bssid) LIKE %s")
+            params.append(like_term)
+        else:
+            sub_clauses: List[str] = []
+
+            sub_clauses.append("LOWER(essid) LIKE %s")
+            params.append(like_term)
+
+            if search_include_bssid:
+                sub_clauses.append("LOWER(bssid) LIKE %s")
+                params.append(like_term)
+
+            sub_clauses.append("LOWER(password) LIKE %s")
+            params.append(like_term)
+
+            if search_include_wps_pin:
+                sub_clauses.append("LOWER(wps_pin) LIKE %s")
+                params.append(like_term)
+
+            sub_clauses.append("LOWER(COALESCE(wsc_device_name, '')) LIKE %s")
+            params.append(like_term)
+            sub_clauses.append("LOWER(COALESCE(wsc_model, '')) LIKE %s")
+            params.append(like_term)
+
+            clauses.append("(" + " OR ".join(sub_clauses) + ")")
 
     return clauses, params
 
@@ -400,6 +428,9 @@ def query_records(
     search: Optional[str] = None,
     limit: Optional[int] = None,
     offset: Optional[int] = None,
+    search_include_bssid: bool = True,
+    search_include_wps_pin: bool = True,
+    search_only_bssid: bool = False,
 ) -> List[WifiRecord]:
     clauses, params = _build_query_filters(
         bssid=bssid,
@@ -409,6 +440,9 @@ def query_records(
         wsc_device_name=wsc_device_name,
         wsc_model=wsc_model,
         search=search,
+        search_include_bssid=search_include_bssid,
+        search_include_wps_pin=search_include_wps_pin,
+        search_only_bssid=search_only_bssid,
     )
     query = [
         "SELECT bssid, essid, password, wps_pin, wsc_device_name, wsc_model, added",
@@ -447,6 +481,9 @@ def count_records(
     wsc_device_name: Optional[str] = None,
     wsc_model: Optional[str] = None,
     search: Optional[str] = None,
+    search_include_bssid: bool = True,
+    search_include_wps_pin: bool = True,
+    search_only_bssid: bool = False,
 ) -> int:
     clauses, params = _build_query_filters(
         bssid=bssid,
@@ -456,6 +493,9 @@ def count_records(
         wsc_device_name=wsc_device_name,
         wsc_model=wsc_model,
         search=search,
+        search_include_bssid=search_include_bssid,
+        search_include_wps_pin=search_include_wps_pin,
+        search_only_bssid=search_only_bssid,
     )
 
     sql_parts = ["SELECT COUNT(*) AS total FROM wifi_records"]
@@ -501,6 +541,28 @@ def enforce_request_limits():
 def index() -> str:
     raw_search = request.args.get("search", "")
     search = raw_search.strip()
+    search_include_bssid = True
+    search_include_wps_pin = True
+    search_only_bssid = False
+
+    if search:
+        upper_search = search.upper()
+
+        if PARTIAL_BSSID_SEARCH_PATTERN.fullmatch(search):
+            search_only_bssid = True
+            search_include_bssid = True
+            search_include_wps_pin = False
+        else:
+            search_include_bssid = False
+
+        if "NULL" in upper_search:
+            search_include_wps_pin = True
+        else:
+            if search.isdigit() and len(search) <= 9:
+                search_include_wps_pin = True
+            else:
+                search_include_wps_pin = False
+
     page_param = request.args.get("page", "1")
     try:
         page = int(page_param)
@@ -510,7 +572,12 @@ def index() -> str:
         page = 1
 
     per_page = PAGE_SIZE
-    total_count = count_records(search=search or None)
+    total_count = count_records(
+        search=search or None,
+        search_include_bssid=search_include_bssid,
+        search_include_wps_pin=search_include_wps_pin,
+        search_only_bssid=search_only_bssid,
+    )
     total_pages = (total_count + per_page - 1) // per_page if total_count else 0
 
     if total_pages == 0:
@@ -521,7 +588,14 @@ def index() -> str:
             page = total_pages
         offset = (page - 1) * per_page
 
-    records = query_records(search=search or None, limit=per_page, offset=offset if total_count else 0)
+    records = query_records(
+        search=search or None,
+        limit=per_page,
+        offset=offset if total_count else 0,
+        search_include_bssid=search_include_bssid,
+        search_include_wps_pin=search_include_wps_pin,
+        search_only_bssid=search_only_bssid,
+    )
     start_index = offset + 1 if total_count else 0
     end_index = offset + len(records) if total_count else 0
     has_prev = total_pages > 0 and page > 1
