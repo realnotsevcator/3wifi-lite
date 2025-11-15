@@ -1,0 +1,21 @@
+body {
+    background: #f9f9f9;
+    color: #222;
+}
+
+main {
+    margin-top: 3rem;
+}
+
+table {
+    width: 100%;
+}
+
+th, td {
+    text-align: left;
+}
+
+.mono {
+    font-family: "Fira Mono", "Courier New", monospace;
+    font-size: 0.9rem;
+}
