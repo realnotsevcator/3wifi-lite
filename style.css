@@ -188,6 +188,23 @@ tr:nth-child(even) td {
     border-radius: 6px;
 }
 
+.disclaimer {
+    box-shadow: none;
+    background: #f1f2f5;
+    border: 1px dashed var(--panel-border);
+    border-radius: 12px;
+    max-width: 1100px;
+    margin: -0.5rem auto 0;
+    font-size: 0.85rem;
+    color: var(--muted);
+    text-align: center;
+}
+
+.disclaimer p {
+    margin: 0;
+    line-height: 1.5;
+}
+
 @media (max-width: 720px) {
     body {
         padding: 1.5rem 1rem 2.5rem;

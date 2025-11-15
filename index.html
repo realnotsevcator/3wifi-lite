@@ -11,7 +11,7 @@
     <main class="layout">
         <section class="panel">
             <div class="panel-header">
-                <h1>3WiFi Lite</h1>
+                <h1 class="sr-only">3WiFi Lite</h1>
                 <div class="summary">
                     <span>{{ records|length }} record{{ records|length != 1 and 's' or '' }}</span>
                     {% if search %}
@@ -66,5 +66,11 @@
             {% endif %}
         </section>
     </main>
+    <footer class="panel disclaimer">
+        <p>
+            This site template is provided solely for protecting and testing your own Wi-Fi network. Do not use it to
+            compromise third-party infrastructure.
+        </p>
+    </footer>
 </body>
 </html>
