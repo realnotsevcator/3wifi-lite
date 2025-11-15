@@ -1,35 +1,18 @@
-import atexit
 import logging
 import os
-import queue
 import re
-import threading
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from pathlib import Path
 from time import monotonic
-from typing import Any, Callable, Dict, Iterator, List, Mapping, Optional, Tuple, Union
+from typing import Any, Dict, Iterator, List, Mapping, Optional, Tuple, Union
+from urllib.parse import parse_qs, urlparse
 
 from flask import Flask, jsonify, render_template, request
-from sqlalchemy import (
-    Column,
-    DateTime,
-    Index,
-    Integer,
-    MetaData,
-    String,
-    Table,
-    and_,
-    create_engine,
-    func,
-    insert,
-    or_,
-    select,
-)
-from sqlalchemy.engine import Connection
-from sqlalchemy.engine.url import make_url
-from sqlalchemy.exc import IntegrityError, SQLAlchemyError
+import pymysql
+from pymysql import err as pymysql_err
+from pymysql.cursors import DictCursor
 
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
@@ -52,22 +35,47 @@ def _get_int_env(name: str, default: int) -> int:
         return default
 
 
-def _auto_worker_threads() -> int:
-    cpu_total = os.cpu_count()
-    if not cpu_total or cpu_total < 1:
-        return 1
-    # avoid spawning an excessive number of background workers on high-core systems
-    return max(1, min(32, cpu_total))
-
-
 APP_ROOT = Path(__file__).resolve().parent
 RATE_LIMIT_WINDOW_SECONDS = _get_int_env("RATE_LIMIT_WINDOW_SECONDS", 5)
 MAX_UPLOADS_PER_DAY = _get_int_env("MAX_UPLOADS_PER_DAY", 30)
 PAGE_SIZE = _get_int_env("PAGE_SIZE", 100)
-DB_WORKER_THREADS = _get_int_env("DB_WORKER_THREADS", _auto_worker_threads())
 
 BSSID_PATTERN = re.compile(r"^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$")
 WPS_PIN_PATTERN = re.compile(r"^[0-9]{8}$")
+
+
+@dataclass(frozen=True)
+class DatabaseConfig:
+    host: str
+    port: int
+    user: str
+    password: str
+    database: str
+    charset: str = "utf8mb4"
+
+
+def _parse_database_url(url: str) -> DatabaseConfig:
+    parsed = urlparse(url)
+    if not parsed.scheme or not parsed.scheme.startswith("mysql"):
+        raise RuntimeError(
+            "DATABASE_URL must use the MySQL backend (e.g. mysql://user:pass@host/db)"
+        )
+
+    if not parsed.path or parsed.path == "/":
+        raise RuntimeError("DATABASE_URL must include the database name")
+
+    query_params = parse_qs(parsed.query)
+    charset = query_params.get("charset", ["utf8mb4"])[0] or "utf8mb4"
+
+    return DatabaseConfig(
+        host=parsed.hostname or "localhost",
+        port=parsed.port or 3306,
+        user=parsed.username or "",
+        password=parsed.password or "",
+        database=parsed.path.lstrip("/"),
+        charset=charset,
+    )
+
 
 raw_database_url = os.getenv("DATABASE_URL")
 if not raw_database_url:
@@ -75,40 +83,7 @@ if not raw_database_url:
         "DATABASE_URL environment variable must be set to a MySQL connection string"
     )
 
-database_url_object = make_url(raw_database_url)
-if database_url_object.get_backend_name() != "mysql":
-    raise RuntimeError("DATABASE_URL must use the MySQL backend (e.g. mysql+pymysql)")
-
-DATABASE_URL = database_url_object.render_as_string(hide_password=False)
-
-engine = create_engine(
-    DATABASE_URL,
-    future=True,
-    pool_pre_ping=True,
-)
-
-
-metadata = MetaData()
-
-wifi_records_table = Table(
-    "wifi_records",
-    metadata,
-    Column("id", Integer, primary_key=True, autoincrement=True),
-    Column("bssid", String(17), nullable=False),
-    Column("essid", String(255), nullable=False),
-    Column("password", String(255)),
-    Column("wps_pin", String(16)),
-    Column("wsc_device_name", String(255)),
-    Column("wsc_model", String(255)),
-    Column("added", DateTime(timezone=True), server_default=func.now(), nullable=False),
-    mysql_engine="InnoDB",
-    mysql_charset="utf8mb4",
-    mysql_collate="utf8mb4_unicode_ci",
-)
-
-Index("ix_wifi_records_bssid", wifi_records_table.c.bssid)
-Index("ix_wifi_records_essid", wifi_records_table.c.essid)
-Index("ix_wifi_records_wps_pin", wifi_records_table.c.wps_pin)
+DATABASE_CONFIG = _parse_database_url(raw_database_url)
 
 
 _last_request_times: Dict[str, float] = {}
@@ -117,13 +92,44 @@ _daily_upload_totals = {"date": None, "count": 0}
 
 
 @contextmanager
-def get_db_connection() -> Iterator[Connection]:
-    with engine.begin() as connection:
+def get_db_connection() -> Iterator[pymysql.connections.Connection]:
+    connection = pymysql.connect(
+        host=DATABASE_CONFIG.host,
+        port=DATABASE_CONFIG.port,
+        user=DATABASE_CONFIG.user,
+        password=DATABASE_CONFIG.password,
+        database=DATABASE_CONFIG.database,
+        charset=DATABASE_CONFIG.charset,
+        autocommit=False,
+        cursorclass=DictCursor,
+    )
+    try:
         yield connection
+    finally:
+        connection.close()
 
 
 def init_db() -> None:
-    metadata.create_all(engine, checkfirst=True)
+    create_table_sql = """
+    CREATE TABLE IF NOT EXISTS wifi_records (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        bssid VARCHAR(17) NOT NULL,
+        essid VARCHAR(255) NOT NULL,
+        password VARCHAR(255),
+        wps_pin VARCHAR(16),
+        wsc_device_name VARCHAR(255),
+        wsc_model VARCHAR(255),
+        added TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        KEY ix_wifi_records_bssid (bssid),
+        KEY ix_wifi_records_essid (essid),
+        KEY ix_wifi_records_wps_pin (wps_pin)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+    """
+
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(create_table_sql)
+        conn.commit()
 
 
 @dataclass
@@ -138,10 +144,7 @@ class WifiRecord:
 
     @classmethod
     def from_row(cls, row: Mapping[str, Any]) -> "WifiRecord":
-        if hasattr(row, "_mapping"):
-            data = row._mapping  # type: ignore[attr-defined]
-        else:
-            data = row
+        data = row
         return cls(
             bssid=data["bssid"],
             essid=data["essid"],
@@ -166,65 +169,6 @@ class WifiRecord:
 
 class DuplicateRecordError(ValueError):
     """Raised when attempting to add an existing Wi-Fi record."""
-
-
-class DatabaseWorkerPool:
-    def __init__(self, worker_count: int):
-        self._worker_count = max(1, worker_count)
-        self._tasks: "queue.Queue[Optional[Tuple[Callable[..., Any], tuple, dict, queue.Queue]]]" = queue.Queue()
-        self._threads: List[threading.Thread] = []
-        self._shutdown = threading.Event()
-
-        for index in range(self._worker_count):
-            thread = threading.Thread(
-                target=self._worker,
-                name=f"DatabaseWorker-{index + 1}",
-                daemon=True,
-            )
-            self._threads.append(thread)
-            thread.start()
-
-    def submit(self, func: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
-        if self._shutdown.is_set():
-            raise RuntimeError("Database worker pool has been shut down")
-
-        result_queue: "queue.Queue[Tuple[bool, Any]]" = queue.Queue(maxsize=1)
-        self._tasks.put((func, args, kwargs, result_queue))
-        success, payload = result_queue.get()
-        if success:
-            return payload
-        if isinstance(payload, BaseException):
-            raise payload
-        raise RuntimeError("Database task failed without raising an exception")
-
-    def shutdown(self) -> None:
-        if self._shutdown.is_set():
-            return
-        self._shutdown.set()
-        for _ in self._threads:
-            self._tasks.put(None)
-        for thread in self._threads:
-            thread.join(timeout=2)
-
-    def _worker(self) -> None:
-        while True:
-            task = self._tasks.get()
-            if task is None:
-                self._tasks.task_done()
-                break
-            func, args, kwargs, result_queue = task
-            try:
-                result = func(*args, **kwargs)
-            except Exception as exc:  # pragma: no cover - defensive guard
-                result_queue.put((False, exc))
-            else:
-                result_queue.put((True, result))
-            finally:
-                self._tasks.task_done()
-
-
-database_worker_pool = DatabaseWorkerPool(DB_WORKER_THREADS)
-atexit.register(database_worker_pool.shutdown)
 
 
 def _get_client_ip() -> str:
@@ -341,65 +285,6 @@ def validate_password(password: Optional[str]) -> str:
     return password
 
 
-def _insert_record_task(
-    bssid: str,
-    essid: str,
-    password: str,
-    wps_pin: str,
-    *,
-    wsc_device_name: Optional[str],
-    wsc_model: Optional[str],
-) -> WifiRecord:
-    with get_db_connection() as conn:
-        duplicate_query = (
-            select(wifi_records_table.c.id)
-            .where(
-                and_(
-                    wifi_records_table.c.bssid == bssid,
-                    wifi_records_table.c.essid == essid,
-                    wifi_records_table.c.password == password,
-                    wifi_records_table.c.wps_pin == wps_pin,
-                )
-            )
-            .limit(1)
-        )
-        duplicate = conn.execute(duplicate_query).first()
-        if duplicate:
-            raise DuplicateRecordError(
-                "A record with the same BSSID, ESSID, Password, and WPS Pin already exists."
-            )
-        insert_stmt = insert(wifi_records_table).values(
-            bssid=bssid,
-            essid=essid,
-            password=password,
-            wps_pin=wps_pin,
-            wsc_device_name=wsc_device_name,
-            wsc_model=wsc_model,
-        )
-        result = conn.execute(insert_stmt)
-        record_id = result.inserted_primary_key[0] if result.inserted_primary_key else None
-        if record_id is None:
-            raise RuntimeError("Failed to retrieve inserted record identifier")
-        row = (
-            conn.execute(
-                select(
-                    wifi_records_table.c.bssid,
-                    wifi_records_table.c.essid,
-                    wifi_records_table.c.password,
-                    wifi_records_table.c.wps_pin,
-                    wifi_records_table.c.wsc_device_name,
-                    wifi_records_table.c.wsc_model,
-                    wifi_records_table.c.added,
-                ).where(wifi_records_table.c.id == record_id)
-            )
-            .mappings()
-            .first()
-        )
-        if row is None:
-            raise RuntimeError("Inserted record could not be retrieved")
-    return WifiRecord.from_row(row)
-
-
 def insert_record(
     bssid: str,
     essid: str,
@@ -409,15 +294,55 @@ def insert_record(
     wsc_device_name: Optional[str],
     wsc_model: Optional[str],
 ) -> WifiRecord:
-    return database_worker_pool.submit(
-        _insert_record_task,
-        bssid,
-        essid,
-        password,
-        wps_pin,
-        wsc_device_name=wsc_device_name,
-        wsc_model=wsc_model,
-    )
+    with get_db_connection() as conn:
+        row_result: Mapping[str, Any]
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT id FROM wifi_records
+                    WHERE bssid = %s AND essid = %s AND password = %s AND wps_pin = %s
+                    LIMIT 1
+                    """,
+                    (bssid, essid, password, wps_pin),
+                )
+                duplicate = cursor.fetchone()
+                if duplicate:
+                    raise DuplicateRecordError(
+                        "A record with the same BSSID, ESSID, Password, and WPS Pin already exists."
+                    )
+
+                cursor.execute(
+                    """
+                    INSERT INTO wifi_records
+                        (bssid, essid, password, wps_pin, wsc_device_name, wsc_model)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                    """,
+                    (bssid, essid, password, wps_pin, wsc_device_name, wsc_model),
+                )
+                record_id = cursor.lastrowid
+                if not record_id:
+                    raise RuntimeError("Failed to retrieve inserted record identifier")
+
+                cursor.execute(
+                    """
+                    SELECT bssid, essid, password, wps_pin, wsc_device_name, wsc_model, added
+                    FROM wifi_records
+                    WHERE id = %s
+                    """,
+                    (record_id,),
+                )
+                row = cursor.fetchone()
+                if row is None:
+                    raise RuntimeError("Inserted record could not be retrieved")
+
+                row_result = row
+
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+    return WifiRecord.from_row(row_result)
 
 
 def _build_query_filters(
@@ -429,83 +354,39 @@ def _build_query_filters(
     wsc_device_name: Optional[str] = None,
     wsc_model: Optional[str] = None,
     search: Optional[str] = None,
-) -> List[Any]:
-    clauses: List[Any] = []
+) -> Tuple[List[str], List[Any]]:
+    clauses: List[str] = []
+    params: List[Any] = []
 
     if bssid:
-        clauses.append(wifi_records_table.c.bssid == bssid.upper())
+        clauses.append("bssid = %s")
+        params.append(bssid.upper())
     if essid:
-        clauses.append(wifi_records_table.c.essid == essid)
+        clauses.append("essid = %s")
+        params.append(essid)
     if password:
-        clauses.append(wifi_records_table.c.password == password)
+        clauses.append("password = %s")
+        params.append(password)
     if wps_pin:
         normalized_pin = wps_pin.upper() if wps_pin.upper() == "NULL" else wps_pin
-        clauses.append(wifi_records_table.c.wps_pin == normalized_pin)
+        clauses.append("wps_pin = %s")
+        params.append(normalized_pin)
     if wsc_device_name:
-        clauses.append(wifi_records_table.c.wsc_device_name == wsc_device_name)
+        clauses.append("wsc_device_name = %s")
+        params.append(wsc_device_name)
     if wsc_model:
-        clauses.append(wifi_records_table.c.wsc_model == wsc_model)
+        clauses.append("wsc_model = %s")
+        params.append(wsc_model)
     if search:
         like_term = f"%{search.lower()}%"
         clauses.append(
-            or_(
-                func.lower(wifi_records_table.c.essid).like(like_term),
-                func.lower(wifi_records_table.c.bssid).like(like_term),
-                func.lower(wifi_records_table.c.password).like(like_term),
-                func.lower(wifi_records_table.c.wps_pin).like(like_term),
-                func.lower(func.coalesce(wifi_records_table.c.wsc_device_name, "")).like(
-                    like_term
-                ),
-                func.lower(func.coalesce(wifi_records_table.c.wsc_model, "")).like(like_term),
-            )
+            "(LOWER(essid) LIKE %s OR LOWER(bssid) LIKE %s OR LOWER(password) LIKE %s "
+            "OR LOWER(wps_pin) LIKE %s OR LOWER(COALESCE(wsc_device_name, '')) LIKE %s "
+            "OR LOWER(COALESCE(wsc_model, '')) LIKE %s)"
         )
+        params.extend([like_term] * 6)
 
-    return clauses
-
-
-def _query_records_task(
-    *,
-    bssid: Optional[str] = None,
-    essid: Optional[str] = None,
-    password: Optional[str] = None,
-    wps_pin: Optional[str] = None,
-    wsc_device_name: Optional[str] = None,
-    wsc_model: Optional[str] = None,
-    search: Optional[str] = None,
-    limit: Optional[int] = None,
-    offset: Optional[int] = None,
-) -> List[WifiRecord]:
-    clauses = _build_query_filters(
-        bssid=bssid,
-        essid=essid,
-        password=password,
-        wps_pin=wps_pin,
-        wsc_device_name=wsc_device_name,
-        wsc_model=wsc_model,
-        search=search,
-    )
-    query = (
-        select(
-            wifi_records_table.c.bssid,
-            wifi_records_table.c.essid,
-            wifi_records_table.c.password,
-            wifi_records_table.c.wps_pin,
-            wifi_records_table.c.wsc_device_name,
-            wifi_records_table.c.wsc_model,
-            wifi_records_table.c.added,
-        )
-        .order_by(wifi_records_table.c.added.desc())
-    )
-    if clauses:
-        query = query.where(and_(*clauses))
-    if limit is not None:
-        query = query.limit(limit)
-    if offset is not None:
-        query = query.offset(offset)
-
-    with get_db_connection() as conn:
-        rows = conn.execute(query).mappings().all()
-    return [WifiRecord.from_row(row) for row in rows]
+    return clauses, params
 
 
 def query_records(
@@ -520,31 +401,7 @@ def query_records(
     limit: Optional[int] = None,
     offset: Optional[int] = None,
 ) -> List[WifiRecord]:
-    return database_worker_pool.submit(
-        _query_records_task,
-        bssid=bssid,
-        essid=essid,
-        password=password,
-        wps_pin=wps_pin,
-        wsc_device_name=wsc_device_name,
-        wsc_model=wsc_model,
-        search=search,
-        limit=limit,
-        offset=offset,
-    )
-
-
-def _count_records_task(
-    *,
-    bssid: Optional[str] = None,
-    essid: Optional[str] = None,
-    password: Optional[str] = None,
-    wps_pin: Optional[str] = None,
-    wsc_device_name: Optional[str] = None,
-    wsc_model: Optional[str] = None,
-    search: Optional[str] = None,
-) -> int:
-    clauses = _build_query_filters(
+    clauses, params = _build_query_filters(
         bssid=bssid,
         essid=essid,
         password=password,
@@ -553,14 +410,32 @@ def _count_records_task(
         wsc_model=wsc_model,
         search=search,
     )
+    query = [
+        "SELECT bssid, essid, password, wps_pin, wsc_device_name, wsc_model, added",
+        "FROM wifi_records",
+    ]
 
-    query = select(func.count()).select_from(wifi_records_table)
     if clauses:
-        query = query.where(and_(*clauses))
+        query.append("WHERE " + " AND ".join(clauses))
+
+    query.append("ORDER BY added DESC")
+
+    if limit is not None:
+        query.append("LIMIT %s")
+        params.append(limit)
+    if offset is not None:
+        if limit is None:
+            query.append("LIMIT 18446744073709551615")
+        query.append("OFFSET %s")
+        params.append(offset)
+
+    sql = " ".join(query)
 
     with get_db_connection() as conn:
-        (total,) = conn.execute(query).one()
-    return int(total)
+        with conn.cursor() as cursor:
+            cursor.execute(sql, params)
+            rows = cursor.fetchall()
+    return [WifiRecord.from_row(row) for row in rows]
 
 
 def count_records(
@@ -573,8 +448,7 @@ def count_records(
     wsc_model: Optional[str] = None,
     search: Optional[str] = None,
 ) -> int:
-    return database_worker_pool.submit(
-        _count_records_task,
+    clauses, params = _build_query_filters(
         bssid=bssid,
         essid=essid,
         password=password,
@@ -583,6 +457,19 @@ def count_records(
         wsc_model=wsc_model,
         search=search,
     )
+
+    sql_parts = ["SELECT COUNT(*) AS total FROM wifi_records"]
+    if clauses:
+        sql_parts.append("WHERE " + " AND ".join(clauses))
+
+    sql = " ".join(sql_parts)
+
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(sql, params)
+            row = cursor.fetchone()
+            total = row["total"] if row else 0
+    return int(total)
 
 
 init_db()
@@ -685,10 +572,10 @@ def add_record():
         )
     except DuplicateRecordError as exc:
         return jsonify({"error": str(exc)}), 400
-    except IntegrityError as exc:
+    except pymysql_err.IntegrityError as exc:
         logger.exception("Failed to insert record")
         return jsonify({"error": "Failed to insert record", "details": str(exc)}), 400
-    except SQLAlchemyError as exc:
+    except pymysql_err.MySQLError as exc:
         logger.exception("Unexpected database error")
         return jsonify({"error": "Database error", "details": str(exc)}), 500
 
