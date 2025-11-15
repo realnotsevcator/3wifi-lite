@@ -5,15 +5,20 @@ import shutil
 import sqlite3
 import threading
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import List, Optional
+from time import monotonic
+from typing import Dict, List, Optional
 
 from flask import Flask, jsonify, render_template, request
 
 APP_ROOT = Path(__file__).resolve().parent
 DATABASE_PATH = APP_ROOT / "data.sqlite3"
 BACKUP_INTERVAL_SECONDS = int(os.getenv("BACKUP_INTERVAL_SECONDS", "3600"))
+DAILY_BACKUP_DIR = Path(os.getenv("DAILY_BACKUP_DIR", APP_ROOT / "daily_backups"))
+DAILY_BACKUP_RETENTION = int(os.getenv("DAILY_BACKUP_RETENTION", "30"))
+RATE_LIMIT_WINDOW_SECONDS = int(os.getenv("RATE_LIMIT_WINDOW_SECONDS", "5"))
+MAX_UPLOADS_PER_DAY = int(os.getenv("MAX_UPLOADS_PER_DAY", "30"))
 
 BSSID_PATTERN = re.compile(r"^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$")
 WPS_PIN_PATTERN = re.compile(r"^[0-9]{8}$")
@@ -21,6 +26,10 @@ WPS_PIN_PATTERN = re.compile(r"^[0-9]{8}$")
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 logger = logging.getLogger(__name__)
+
+
+_last_request_times: Dict[str, float] = {}
+_upload_counters: Dict[str, Dict[str, object]] = {}
 
 
 def get_db_connection() -> sqlite3.Connection:
@@ -180,6 +189,74 @@ class BackupManager:
             self._stop_event.wait(self.interval_seconds)
 
 
+class DailyBackupManager:
+    def __init__(self, directory: Path, retention: int):
+        self.directory = directory
+        self.retention = max(1, retention)
+        self.directory.mkdir(parents=True, exist_ok=True)
+        self._stop_event = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+
+    def start(self) -> None:
+        if self._thread and self._thread.is_alive():
+            return
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+        logger.info(
+            "Daily backup manager started at directory %s with retention %s", self.directory, self.retention
+        )
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        if self._thread:
+            self._thread.join(timeout=2)
+
+    def _run(self) -> None:
+        while not self._stop_event.is_set():
+            wait_seconds = self._seconds_until_next_midnight()
+            if wait_seconds <= 0:
+                wait_seconds = 1
+            if self._stop_event.wait(wait_seconds):
+                break
+            try:
+                self._create_backup()
+            except Exception:  # pragma: no cover - safeguard
+                logger.exception("Unexpected error while creating daily backup")
+
+    def _create_backup(self) -> None:
+        if not DATABASE_PATH.exists():
+            logger.warning("Database file %s not found; skipping daily backup", DATABASE_PATH)
+            return
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%d")
+        destination = self.directory / f"wifi-daily-backup-{timestamp}.sqlite3"
+        if destination.exists():
+            logger.info("Daily backup already exists for %s; skipping", timestamp)
+        else:
+            shutil.copy2(DATABASE_PATH, destination)
+            logger.info("Created daily backup at %s", destination)
+        self._enforce_retention()
+
+    def _enforce_retention(self) -> None:
+        backups = sorted(
+            self.directory.glob("wifi-daily-backup-*.sqlite3"),
+            key=lambda path: path.stat().st_mtime,
+        )
+        excess = len(backups) - self.retention
+        for i in range(excess):
+            to_remove = backups[i]
+            try:
+                to_remove.unlink()
+                logger.info("Removed expired daily backup %s", to_remove)
+            except FileNotFoundError:
+                logger.debug("Daily backup %s already removed", to_remove)
+
+    @staticmethod
+    def _seconds_until_next_midnight() -> float:
+        now = datetime.now(timezone.utc)
+        next_midnight = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+        return (next_midnight - now).total_seconds()
+
+
 def create_backup_provider() -> Optional[BaseBackupProvider]:
     provider_name = os.getenv("BACKUP_PROVIDER", "local").strip().lower()
     if provider_name == "none":
@@ -200,6 +277,42 @@ def create_backup_provider() -> Optional[BaseBackupProvider]:
 def _generate_backup_filename() -> str:
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     return f"wifi-backup-{timestamp}.sqlite3"
+
+
+def _get_client_ip() -> str:
+    forwarded_for = request.headers.get("X-Forwarded-For", "")
+    if forwarded_for:
+        ip = forwarded_for.split(",")[0].strip()
+        if ip:
+            return ip
+    return request.remote_addr or "unknown"
+
+
+def _prune_stale_rate_limits(now: float) -> None:
+    expiry = RATE_LIMIT_WINDOW_SECONDS * 12
+    if expiry <= 0:
+        return
+    stale_ips = [ip for ip, ts in _last_request_times.items() if now - ts > expiry]
+    for ip in stale_ips:
+        _last_request_times.pop(ip, None)
+
+
+def _can_upload_today(ip: str) -> bool:
+    today = datetime.now(timezone.utc).date()
+    entry = _upload_counters.get(ip)
+    if not entry or entry.get("date") != today:
+        _upload_counters[ip] = {"date": today, "count": 0}
+        entry = _upload_counters[ip]
+    return entry["count"] < MAX_UPLOADS_PER_DAY
+
+
+def _mark_upload(ip: str) -> None:
+    today = datetime.now(timezone.utc).date()
+    entry = _upload_counters.get(ip)
+    if not entry or entry.get("date") != today:
+        _upload_counters[ip] = {"date": today, "count": 0}
+        entry = _upload_counters[ip]
+    entry["count"] += 1
 
 
 def _format_timestamp(value: Optional[str]) -> str:
@@ -384,6 +497,31 @@ app = Flask(
 )
 backup_manager = BackupManager(create_backup_provider(), BACKUP_INTERVAL_SECONDS)
 backup_manager.start()
+daily_backup_manager = DailyBackupManager(DAILY_BACKUP_DIR, DAILY_BACKUP_RETENTION)
+daily_backup_manager.start()
+
+
+@app.before_request
+def enforce_request_limits():
+    if request.endpoint == "static":
+        return None
+    if request.path.startswith("/api/"):
+        ip = _get_client_ip()
+        now = monotonic()
+        last_seen = _last_request_times.get(ip)
+        if last_seen is not None and now - last_seen < RATE_LIMIT_WINDOW_SECONDS:
+            retry_after = max(0.0, RATE_LIMIT_WINDOW_SECONDS - (now - last_seen))
+            return (
+                jsonify(
+                    {
+                        "error": "Too many requests",
+                        "retry_after": round(retry_after, 2),
+                    }
+                ),
+                429,
+            )
+        _prune_stale_rate_limits(now)
+        _last_request_times[ip] = now
 
 
 @app.route("/")
@@ -396,6 +534,9 @@ def index() -> str:
 
 @app.post("/api/records")
 def add_record():
+    ip = _get_client_ip()
+    if not _can_upload_today(ip):
+        return jsonify({"error": "Daily upload limit reached"}), 429
     if request.is_json:
         payload = request.get_json() or {}
     else:
@@ -423,6 +564,7 @@ def add_record():
         logger.exception("Failed to insert record")
         return jsonify({"error": "Failed to insert record", "details": str(exc)}), 400
 
+    _mark_upload(ip)
     return jsonify(record.as_dict()), 201
 
 

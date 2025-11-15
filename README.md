@@ -80,6 +80,8 @@ Returns an array of all matching records for the specified BSSID or `404` when n
 ## Backups
 
 Backups run automatically in a background thread with the interval `BACKUP_INTERVAL_SECONDS` (default 3600 seconds).
+In addition, daily snapshots are written locally at `00:00 UTC` to the `daily_backups/` directory. The folder keeps at most 30
+files (oldest snapshots are removed when the limit is exceeded) and is never uploaded to Mega.nz.
 
 The `BACKUP_PROVIDER` environment variable selects the provider:
 
