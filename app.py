@@ -48,13 +48,21 @@ def _auto_worker_threads() -> int:
 
 APP_ROOT = Path(__file__).resolve().parent
 DATABASE_PATH = APP_ROOT / "data.sqlite3"
-BACKUP_INTERVAL_SECONDS = _get_int_env("BACKUP_INTERVAL_SECONDS", 3600)
-DAILY_BACKUP_DIR = Path(os.getenv("DAILY_BACKUP_DIR", APP_ROOT / "daily_backups"))
-DAILY_BACKUP_RETENTION = _get_int_env("DAILY_BACKUP_RETENTION", 30)
+BACKUP_INTERVAL_SECONDS = _get_int_env("BACKUP_INTERVAL_SECONDS", 86400)
+DAILY_BACKUP_ROOT = Path(os.getenv("DAILY_BACKUP_ROOT", APP_ROOT / "daily_backups"))
+_legacy_daily_backup_dir = os.getenv("DAILY_BACKUP_DIR")
+if _legacy_daily_backup_dir:
+    THIRTY_DAY_BACKUP_DIR = Path(_legacy_daily_backup_dir)
+else:
+    THIRTY_DAY_BACKUP_DIR = Path(
+        os.getenv("THIRTY_DAY_BACKUP_DIR", DAILY_BACKUP_ROOT / "30-day-retention")
+    )
+THIRTY_DAY_BACKUP_RETENTION = _get_int_env("THIRTY_DAY_BACKUP_RETENTION", 30)
 RATE_LIMIT_WINDOW_SECONDS = _get_int_env("RATE_LIMIT_WINDOW_SECONDS", 5)
 MAX_UPLOADS_PER_DAY = _get_int_env("MAX_UPLOADS_PER_DAY", 30)
 PAGE_SIZE = _get_int_env("PAGE_SIZE", 100)
 DB_WORKER_THREADS = _get_int_env("DB_WORKER_THREADS", _auto_worker_threads())
+MEGA_BACKUP_FILENAME = os.getenv("MEGA_BACKUP_FILENAME", "data.sqlite3")
 
 BSSID_PATTERN = re.compile(r"^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$")
 WPS_PIN_PATTERN = re.compile(r"^[0-9]{8}$")
@@ -192,7 +200,7 @@ class LocalBackupProvider(BaseBackupProvider):
 
 
 class MegaBackupProvider(BaseBackupProvider):
-    def __init__(self, email: str, password: str, folder: str):
+    def __init__(self, email: str, password: str, folder: str, remote_filename: str):
         try:
             from mega import Mega
         except ImportError as exc:  # pragma: no cover - optional dependency
@@ -204,6 +212,7 @@ class MegaBackupProvider(BaseBackupProvider):
         self._m = self._mega.login(email, password)
         self._folder_name = folder
         self._folder_handle = self._ensure_folder(folder)
+        self._remote_filename = remote_filename
         logger.info("Authenticated with Mega.nz for automatic backups")
 
     def _ensure_folder(self, folder_name: str):
@@ -216,12 +225,29 @@ class MegaBackupProvider(BaseBackupProvider):
 
     def backup(self, source_path: Path, destination_name: str) -> None:
         validated_source = _validate_backup_source(source_path)
-        logger.info("Uploading backup %s to Mega.nz", destination_name)
+        try:
+            self._purge_existing_backups()
+        except Exception as exc:  # pragma: no cover - safeguard for Mega API changes
+            raise BackupError("Failed to remove existing Mega.nz backups") from exc
+        logger.info("Uploading backup %s to Mega.nz", self._remote_filename)
         self._m.upload(
             str(validated_source),
             dest=self._folder_handle,
-            dest_filename=destination_name,
+            dest_filename=self._remote_filename,
         )
+
+    def _purge_existing_backups(self) -> None:
+        files = self._m.get_files()
+        stale_handles = [
+            handle
+            for handle, info in files.items()
+            if info.get("a")
+            and info["a"].get("n") == self._remote_filename
+            and info.get("p") == self._folder_handle
+        ]
+        for handle in stale_handles:
+            self._m.destroy(handle)
+            logger.info("Removed existing Mega.nz backup %s", self._remote_filename)
 
 
 class BackupManager:
@@ -253,17 +279,31 @@ class BackupManager:
         self.provider.backup(DATABASE_PATH, backup_name)
 
     def _run(self) -> None:
+        first_run = True
         while not self._stop_event.is_set():
+            wait_seconds = self._seconds_until_next_run(first_run)
+            first_run = False
+            if wait_seconds > 0 and self._stop_event.wait(wait_seconds):
+                break
             try:
                 self.trigger_backup()
             except BackupError as err:
                 logger.error("Backup failed: %s", err)
             except Exception:  # pragma: no cover - safeguard
                 logger.exception("Unexpected error during backup")
-            self._stop_event.wait(self.interval_seconds)
+
+    def _seconds_until_next_run(self, first_run: bool) -> float:
+        if self.interval_seconds == 86400:
+            wait_seconds = DailyBackupManager._seconds_until_next_midnight()
+            return max(1, wait_seconds)
+        if first_run:
+            return 0
+        return max(1, float(self.interval_seconds))
 
 
 class DailyBackupManager:
+    """Create on-disk daily backups with strict local storage."""
+
     def __init__(self, directory: Path, retention: int):
         self.directory = directory
         self.retention = max(1, retention)
@@ -402,8 +442,16 @@ def create_backup_provider() -> Optional[BaseBackupProvider]:
         password = os.getenv("MEGA_PASSWORD")
         folder = os.getenv("MEGA_FOLDER", "3wifi-lite-backups")
         if not email or not password:
-            raise BackupError("MEGA_EMAIL and MEGA_PASSWORD environment variables must be set for Mega backups")
-        return MegaBackupProvider(email=email, password=password, folder=folder)
+            raise BackupError(
+                "MEGA_EMAIL and MEGA_PASSWORD environment variables must be set for Mega backups"
+            )
+        remote_filename = os.getenv("MEGA_BACKUP_FILENAME", MEGA_BACKUP_FILENAME)
+        return MegaBackupProvider(
+            email=email,
+            password=password,
+            folder=folder,
+            remote_filename=remote_filename,
+        )
     raise BackupError(f"Unsupported backup provider: {provider_name}")
 
 
@@ -787,7 +835,10 @@ app = Flask(
 )
 backup_manager = BackupManager(create_backup_provider(), BACKUP_INTERVAL_SECONDS)
 backup_manager.start()
-daily_backup_manager = DailyBackupManager(DAILY_BACKUP_DIR, DAILY_BACKUP_RETENTION)
+daily_backup_manager = DailyBackupManager(
+    THIRTY_DAY_BACKUP_DIR,
+    THIRTY_DAY_BACKUP_RETENTION,
+)
 daily_backup_manager.start()
 
 
