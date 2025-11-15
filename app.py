@@ -6,7 +6,7 @@ import re
 import threading
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from pathlib import Path
 from time import monotonic
 from typing import Any, Callable, Dict, Iterator, List, Mapping, Optional, Tuple, Union
