@@ -43,7 +43,7 @@ PAGE_SIZE = _get_int_env("PAGE_SIZE", 100)
 BSSID_PATTERN = re.compile(r"^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$")
 WPS_PIN_PATTERN = re.compile(r"^[0-9]{8}$")
 
-# 3–6 octets separated by colons (e.g. XX:XX:XX or XX:XX:XX:XX:XX:XX)
+# 3-6 octets separated by colons (e.g. XX:XX:XX or XX:XX:XX:XX:XX:XX)
 PARTIAL_BSSID_SEARCH_PATTERN = re.compile(
     r"^([0-9A-Fa-f]{2}:){2,5}[0-9A-Fa-f]{2}$"
 )
