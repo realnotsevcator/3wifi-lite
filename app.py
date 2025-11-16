@@ -124,10 +124,7 @@ def init_db() -> None:
         wps_pin VARCHAR(16),
         wsc_device_name VARCHAR(255),
         wsc_model VARCHAR(255),
-        added TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-        KEY ix_wifi_records_bssid (bssid),
-        KEY ix_wifi_records_essid (essid),
-        KEY ix_wifi_records_wps_pin (wps_pin)
+        added TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
     """
 
