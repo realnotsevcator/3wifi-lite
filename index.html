@@ -13,11 +13,7 @@
             <div class="panel-header">
                 <h1 class="sr-only">3WiFi Lite</h1>
                 <div class="summary">
-                    {% if total_count %}
-                    <span>Showing {{ start_index }}&ndash;{{ end_index }} of {{ total_count }} record{{ total_count != 1 and 's' or '' }}</span>
-                    {% else %}
-                    <span>{% if search %}No matching records{% else %}No records stored yet{% endif %}</span>
-                    {% endif %}
+                    <span>Showing {{ record_count }} record{{ record_count != 1 and 's' or '' }}</span>
                     {% if search %}
                     <span class="muted">Filter: "{{ search }}"</span>
                     {% endif %}
@@ -62,14 +58,14 @@
                     {% endfor %}
                 </tbody>
             </table>
-            {% if total_pages > 1 %}
+            {% if has_prev or has_next %}
             <nav class="pagination" aria-label="Pagination">
                 {% if has_prev %}
                 <a class="pagination-link" href="{{ url_for('index', search=search, page=page - 1) if search else url_for('index', page=page - 1) }}">&larr; Previous</a>
                 {% else %}
                 <span class="pagination-link disabled">&larr; Previous</span>
                 {% endif %}
-                <span class="pagination-status">Page {{ page }} of {{ total_pages }}</span>
+                <span class="pagination-status">Page {{ page }}</span>
                 {% if has_next %}
                 <a class="pagination-link" href="{{ url_for('index', search=search, page=page + 1) if search else url_for('index', page=page + 1) }}">Next &rarr;</a>
                 {% else %}

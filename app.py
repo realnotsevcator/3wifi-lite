@@ -572,34 +572,23 @@ def index() -> str:
         page = 1
 
     per_page = PAGE_SIZE
-    total_count = count_records(
-        search=search or None,
-        search_include_bssid=search_include_bssid,
-        search_include_wps_pin=search_include_wps_pin,
-        search_only_bssid=search_only_bssid,
-    )
-    total_pages = (total_count + per_page - 1) // per_page if total_count else 0
-
-    if total_pages == 0:
-        page = 1
-        offset = 0
-    else:
-        if page > total_pages:
-            page = total_pages
-        offset = (page - 1) * per_page
+    offset = (page - 1) * per_page
+    fetch_limit = per_page + 1
 
     records = query_records(
         search=search or None,
-        limit=per_page,
-        offset=offset if total_count else 0,
+        limit=fetch_limit,
+        offset=offset,
         search_include_bssid=search_include_bssid,
         search_include_wps_pin=search_include_wps_pin,
         search_only_bssid=search_only_bssid,
     )
-    start_index = offset + 1 if total_count else 0
-    end_index = offset + len(records) if total_count else 0
-    has_prev = total_pages > 0 and page > 1
-    has_next = total_pages > 0 and page < total_pages
+
+    has_next = len(records) > per_page
+    if has_next:
+        records = records[:per_page]
+    has_prev = page > 1
+    record_count = len(records)
 
     return render_template(
         "index.html",
@@ -607,10 +596,7 @@ def index() -> str:
         search=search,
         page=page,
         per_page=per_page,
-        total_count=total_count,
-        total_pages=total_pages,
-        start_index=start_index,
-        end_index=end_index,
+        record_count=record_count,
         has_prev=has_prev,
         has_next=has_next,
     )
@@ -664,11 +650,26 @@ def get_records():
     essid = _normalize_optional_text(request.args.get("essid"))
     wsc_device_name = _normalize_optional_text(request.args.get("wsc_device_name"))
     wsc_model = _normalize_optional_text(request.args.get("wsc_model"))
+    raw_limit = request.args.get("limit")
     try:
-        limit = int(request.args.get("limit", "0"))
+        if raw_limit is None or not raw_limit.strip():
+            limit = PAGE_SIZE
+        else:
+            limit = int(raw_limit)
     except ValueError:
         return jsonify({"error": "limit must be an integer"}), 400
-    limit = limit or None
+    if limit <= 0:
+        limit = PAGE_SIZE
+    limit = min(limit, PAGE_SIZE)
+
+    page_param = request.args.get("page", "1")
+    try:
+        page = int(page_param)
+    except ValueError:
+        page = 1
+    if page < 1:
+        page = 1
+    offset = (page - 1) * limit
 
     password = _normalize_optional_text(request.args.get("password"))
 
@@ -683,6 +684,7 @@ def get_records():
         wsc_model=wsc_model,
         search=search,
         limit=limit,
+        offset=offset,
     )
     return jsonify([record.as_dict() for record in records])
 
