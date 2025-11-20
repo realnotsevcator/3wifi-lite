@@ -4,30 +4,31 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>3WiFi Lite</title>
-    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/milligram/1.4.1/milligram.min.css" integrity="sha512-cX1hIwTZPIYOvTo95OfzmiEJeZVrDCTnhgypKekJy5o+1OtSWT8gJtIhXCTITVEWilQoNqT9XyM54q9WlH0h9Q==" crossorigin="anonymous" referrerpolicy="no-referrer" />
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/milligram/1.4.1/milligram.min.css" crossorigin="anonymous" referrerpolicy="no-referrer" />
     <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
 </head>
 <body>
     <main class="layout">
         <section class="panel">
             <div class="panel-header">
-                <h1 class="sr-only">3WiFi Lite</h1>
-                <div class="summary">
-                    <span>Showing {{ record_count }} record{{ record_count != 1 and 's' or '' }}</span>
-                    {% if search %}
-                    <span class="muted">Filter: "{{ search }}"</span>
-                    {% endif %}
+                <div class="title-block">
+                    <h1>3WiFi Lite</h1>
+                    <p class="total-records">Всего записей: <span>{{ total_records }}</span></p>
                 </div>
             </div>
-            <form method="get" class="search-form">
+            <form method="get" class="search-form" novalidate>
                 <label class="sr-only" for="search">Search by any field</label>
                 <div class="search-controls">
-                    <input type="text" id="search" name="search" value="{{ search }}" placeholder="Search by BSSID, ESSID, password, WPS, device, or model" />
+                    <input type="text" id="search" name="search" value="{{ search }}" placeholder="Search by BSSID, ESSID, password, WPS, device, or model" required minlength="3" />
                     <button type="submit">Search</button>
                     {% if search %}
                     <a class="reset" href="{{ url_for('index') }}">Reset</a>
                     {% endif %}
                 </div>
+                <p class="search-note">Введите минимум 3 символа для поиска.</p>
+                {% if search_error %}
+                <p class="search-feedback">{{ search_error }}</p>
+                {% endif %}
             </form>
         </section>
         <section class="panel">
@@ -60,17 +61,15 @@
             </table>
             {% if has_prev or has_next %}
             <nav class="pagination" aria-label="Pagination">
-                {% if has_prev %}
-                <a class="pagination-link" href="{{ url_for('index', search=search, page=page - 1) if search else url_for('index', page=page - 1) }}">&larr; Previous</a>
-                {% else %}
-                <span class="pagination-link disabled">&larr; Previous</span>
-                {% endif %}
                 <span class="pagination-status">Page {{ page }}</span>
-                {% if has_next %}
-                <a class="pagination-link" href="{{ url_for('index', search=search, page=page + 1) if search else url_for('index', page=page + 1) }}">Next &rarr;</a>
-                {% else %}
-                <span class="pagination-link disabled">Next &rarr;</span>
-                {% endif %}
+                <div class="pagination-actions">
+                    {% if has_prev %}
+                    <a class="pagination-link" href="{{ url_for('index', search=search, page=page - 1) if search else url_for('index', page=page - 1) }}">&larr; Back</a>
+                    {% endif %}
+                    {% if has_next %}
+                    <a class="pagination-link" href="{{ url_for('index', search=search, page=page + 1) if search else url_for('index', page=page + 1) }}">Next &rarr;</a>
+                    {% endif %}
+                </div>
             </nav>
             {% endif %}
             {% else %}
@@ -85,5 +84,29 @@
             {% endif %}
         </section>
     </main>
+    <footer class="site-footer">
+        <p>Powered by SC. <a href="https://github.com/SCDeveloper/3wifi-lite" target="_blank" rel="noopener">Link to repository</a></p>
+    </footer>
+    <script>
+        document.addEventListener('DOMContentLoaded', () => {
+            const form = document.querySelector('.search-form');
+            const input = document.getElementById('search');
+            if (!form || !input) {
+                return;
+            }
+            form.addEventListener('submit', (event) => {
+                const trimmed = input.value.trim();
+                if (trimmed.length < 3) {
+                    event.preventDefault();
+                    input.setCustomValidity(trimmed.length === 0 ? 'Введите запрос' : 'Минимум 3 символа');
+                    input.reportValidity();
+                    return;
+                }
+                input.setCustomValidity('');
+                input.value = trimmed;
+            });
+            input.addEventListener('input', () => input.setCustomValidity(''));
+        });
+    </script>
 </body>
 </html>

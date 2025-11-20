@@ -57,6 +57,7 @@ Response `201 Created` returns the stored record in JSON.
 
 ```
 GET /api/records?search=ELTEX
+GET /api/records?page=2&limit=50
 GET /api/records?bssid=04:95:E6:37:C5:E8
 GET /api/records?essid=ExactESSID
 GET /api/records?password=rostelecom
@@ -65,10 +66,32 @@ GET /api/records?wsc_device_name=RouterBoard
 GET /api/records?wsc_model=RB2011
 ```
 
-The `search` parameter performs a case-insensitive partial lookup on BSSID, ESSID, password, WPS pin, WSC device name, and WSC model. You can search for any substring (for example `12`) via the API or the homepage search bar and all matching records will be returned.
+The `search` parameter performs a case-insensitive partial lookup on BSSID, ESSID, password, WPS pin, WSC device name, and WSC model. Client-side search requires at least three characters, and the API also accepts the optional `page` (1-indexed) and `limit` parameters for pagination.
 
 Exact filters are available through the `bssid`, `essid`, `password`, `wps_pin`, `wsc_device_name`, and `wsc_model` query parameters.
-The response contains an array of objects with fields `bssid`, `essid`, `password`, `wps_pin`, `wsc_device_name`, `wsc_model`, `added` (month captured in `YYYY-MM`, UTC).
+The response is a JSON object:
+
+```json
+{
+  "page": 2,
+  "per_page": 50,
+  "total": 1234,
+  "total_pages": 25,
+  "has_prev": true,
+  "has_next": true,
+  "records": [
+    {
+      "bssid": "04:95:E6:37:C5:E8",
+      "essid": "ExampleWiFi",
+      "password": "secret123",
+      "wps_pin": "12345670",
+      "wsc_device_name": "RouterBoard",
+      "wsc_model": "RB2011",
+      "added": "2024-01"
+    }
+  ]
+}
+```
 
 ### Fetch records by BSSID
 

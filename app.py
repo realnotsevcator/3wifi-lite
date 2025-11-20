@@ -275,6 +275,8 @@ def validate_essid(essid: str) -> str:
     essid = essid.strip()
     if not essid:
         raise ValueError("ESSID is required")
+    if len(essid) > 32:
+        raise ValueError("ESSID must be at most 32 characters long")
     return essid
 
 
@@ -284,6 +286,8 @@ def validate_password(password: Optional[str]) -> str:
     password = str(password).strip()
     if len(password) < 8:
         raise ValueError("Password must be at least 8 characters long")
+    if len(password) > 48:
+        raise ValueError("Password must be at most 48 characters long")
     return password
 
 
@@ -538,14 +542,20 @@ def enforce_request_limits():
 def index() -> str:
     raw_search = request.args.get("search", "")
     search = raw_search.strip()
+    search_error: Optional[str] = None
     search_include_bssid = True
     search_include_wps_pin = True
     search_only_bssid = False
 
-    if search:
-        upper_search = search.upper()
+    effective_search = search
 
-        if PARTIAL_BSSID_SEARCH_PATTERN.fullmatch(search):
+    if search:
+        if len(search) < 3:
+            search_error = "Введите минимум 3 символа для поиска"
+            effective_search = ""
+        upper_search = effective_search.upper() if effective_search else ""
+
+        if effective_search and PARTIAL_BSSID_SEARCH_PATTERN.fullmatch(effective_search):
             search_only_bssid = True
             search_include_bssid = True
             search_include_wps_pin = False
@@ -555,7 +565,7 @@ def index() -> str:
         if "NULL" in upper_search:
             search_include_wps_pin = True
         else:
-            if search.isdigit() and len(search) <= 9:
+            if effective_search and effective_search.isdigit() and len(effective_search) <= 9:
                 search_include_wps_pin = True
             else:
                 search_include_wps_pin = False
@@ -573,7 +583,7 @@ def index() -> str:
     fetch_limit = per_page + 1
 
     records = query_records(
-        search=search or None,
+        search=effective_search or None,
         limit=fetch_limit,
         offset=offset,
         search_include_bssid=search_include_bssid,
@@ -585,7 +595,7 @@ def index() -> str:
     if has_next:
         records = records[:per_page]
     has_prev = page > 1
-    record_count = len(records)
+    total_records = count_records()
 
     return render_template(
         "index.html",
@@ -593,9 +603,10 @@ def index() -> str:
         search=search,
         page=page,
         per_page=per_page,
-        record_count=record_count,
         has_prev=has_prev,
         has_next=has_next,
+        total_records=total_records,
+        search_error=search_error,
     )
 
 
@@ -666,11 +677,29 @@ def get_records():
         page = 1
     if page < 1:
         page = 1
-    offset = (page - 1) * limit
-
     password = _normalize_optional_text(request.args.get("password"))
 
     wps_pin = _normalize_optional_text(request.args.get("wps_pin"))
+
+    total = count_records(
+        bssid=bssid,
+        essid=essid,
+        password=password,
+        wps_pin=wps_pin,
+        wsc_device_name=wsc_device_name,
+        wsc_model=wsc_model,
+        search=search,
+    )
+
+    if total == 0:
+        total_pages = 0
+        page = 1
+        offset = 0
+    else:
+        total_pages = (total + limit - 1) // limit
+        if page > total_pages:
+            page = total_pages
+        offset = (page - 1) * limit
 
     records = query_records(
         bssid=bssid,
@@ -683,7 +712,20 @@ def get_records():
         limit=limit,
         offset=offset,
     )
-    return jsonify([record.as_dict() for record in records])
+    has_prev = page > 1 and total_pages != 0
+    has_next = total_pages != 0 and page < total_pages
+
+    return jsonify(
+        {
+            "page": page,
+            "per_page": limit,
+            "total": total,
+            "total_pages": total_pages,
+            "has_prev": has_prev,
+            "has_next": has_next,
+            "records": [record.as_dict() for record in records],
+        }
+    )
 
 
 @app.get("/api/records/<bssid>")
